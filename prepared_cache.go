@@ -71,6 +71,41 @@ func (p *preparedLRU) remove(key stmtCacheKey) bool {
 	return p.lru.Remove(key)
 }
 
+// updateMetadataIfSame atomically replaces the cache entry for key with val, but
+// only when the currently cached entry is the same completed prepared statement
+// (its done channel is closed and its prepared id matches expectID). It returns
+// true if the replacement happened.
+//
+// This makes the METADATA_CHANGED metadata refresh a single locked operation:
+// the presence/identity check and the replacement cannot be interleaved with a
+// concurrent eviction (which would otherwise be resurrected) or with a newer or
+// still-in-flight prepare installed for the same key (which would otherwise be
+// clobbered).
+func (p *preparedLRU) updateMetadataIfSame(key stmtCacheKey, expectID []byte, val *inflightPrepare) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cur, ok := p.lru.Get(key)
+	if !ok {
+		return false
+	}
+	ifp, ok := cur.(*inflightPrepare)
+	if !ok {
+		return false
+	}
+
+	select {
+	case <-ifp.done:
+		if ifp.preparedStatment != nil && bytes.Equal(ifp.preparedStatment.id, expectID) {
+			p.lru.Add(key, val)
+			return true
+		}
+	default:
+		// still in-flight — leave the newer prepare alone
+	}
+	return false
+}
+
 func (p *preparedLRU) execIfMissing(key stmtCacheKey, fn func(cache *lru.Cache[stmtCacheKey]) *inflightPrepare) (*inflightPrepare, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -110,7 +145,11 @@ func (p *preparedLRU) evictPreparedID(key stmtCacheKey, id []byte) {
 
 	select {
 	case <-ifp.done:
-		if bytes.Equal(id, ifp.preparedStatment.id) {
+		// preparedStatment is nil when the prepare failed. prepareStatement removes
+		// such an entry from the cache before closing done, so it should not be
+		// reachable from here — but that is an ordering nothing enforces, and the
+		// check costs less than the panic. updateMetadataIfSame guards the same way.
+		if ifp.preparedStatment != nil && bytes.Equal(id, ifp.preparedStatment.id) {
 			p.lru.Remove(key)
 		}
 	default:
