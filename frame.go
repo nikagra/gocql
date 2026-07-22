@@ -352,7 +352,12 @@ type framer struct {
 //     via a frame header flag);
 //   - FlagBetaProtocol on proto v5 (beta opt-in must be present on the whole
 //     handshake, including OPTIONS/STARTUP/AUTH_RESPONSE).
+//
+// The version byte is masked with protoVersionMask before comparison, so a
+// direction/reserved high bit on the caller's version (e.g. newFramer passes the
+// unmasked byte) cannot suppress the beta flag or re-enable FlagCompress on v5.
 func defaultFramerFlags(compressor Compressor, version byte) byte {
+	version &= protoVersionMask
 	var flags byte
 	if compressor != nil && version < protoVersion5 {
 		flags |= frm.FlagCompress
@@ -504,7 +509,7 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 			return NewErrProtocol("no compressor available with compressed frame body")
 		}
 
-		f.buf, err = f.compressor.AppendDecompressedWithLength(nil, f.buf)
+		f.buf, err = f.compressor.Decode(f.buf)
 		if err != nil {
 			return err
 		}
@@ -735,7 +740,7 @@ func (f *framer) finish() error {
 		}
 
 		// TODO: only compress frames which are big enough
-		compressed, err := f.compressor.AppendCompressedWithLength(nil, f.buf[headSize:])
+		compressed, err := f.compressor.Encode(f.buf[headSize:])
 		if err != nil {
 			return err
 		}
@@ -1578,6 +1583,17 @@ func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame, customPayload
 		}
 	}
 
+	// Named values are not supported in batches on any protocol version
+	// (CASSANDRA-10246). Reject them up front, before any bytes are written,
+	// so a rejected batch never leaves a partial frame in the reusable buffer.
+	for i := range w.statements {
+		for j := range w.statements[i].values {
+			if w.statements[i].values[j].name != "" {
+				return fmt.Errorf("gocql: named query values are not supported in batches, please see https://issues.apache.org/jira/browse/CASSANDRA-10246")
+			}
+		}
+	}
+
 	if len(customPayload) > 0 {
 		f.payload()
 	}
@@ -1603,15 +1619,6 @@ func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame, customPayload
 		f.writeShort(uint16(len(b.values)))
 		for j := range b.values {
 			col := b.values[j]
-			if col.name != "" {
-				// TODO: move this check into the caller and set a flag on writeBatchFrame
-				// to indicate using named values
-				if f.proto <= protoVersion5 {
-					return fmt.Errorf("gocql: named query values are not supported in batches, please see https://issues.apache.org/jira/browse/CASSANDRA-10246")
-				}
-				flags |= frm.FlagWithNameValues
-				f.writeString(col.name)
-			}
 			if col.isUnset {
 				f.writeUnset()
 			} else {
@@ -1652,7 +1659,7 @@ func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame, customPayload
 	// response versions below protoVersion3.)
 	if f.proto > protoVersion2 {
 		if w.serialConsistency > 0 {
-			f.writeConsistency(Consistency(w.serialConsistency))
+			f.writeConsistency(w.serialConsistency)
 		}
 
 		if w.defaultTimestamp {
@@ -2044,7 +2051,7 @@ func (f *framer) writeBytesMap(m map[string][]byte) {
 func (f *framer) prepareModernLayout() error {
 	// Ensure protocol version is V5 or higher
 	if f.proto < protoVersion5 {
-		panic("Modern layout is not supported with version V4 or less")
+		return fmt.Errorf("gocql: modern layout is not supported with protocol version %d (requires v5+)", f.proto)
 	}
 
 	selfContained := true
@@ -2055,27 +2062,33 @@ func (f *framer) prepareModernLayout() error {
 		err         error
 	)
 
+	// Segment a copy of the frame via a local cursor rather than mutating
+	// f.buf as we go, so that an error partway through segmentation leaves
+	// f.buf byte-for-byte intact. f.buf is only replaced once the whole frame
+	// has been segmented successfully.
+	src := f.buf
+
 	// Process the buffer in chunks if it exceeds the max payload size
-	for len(f.buf) > maxSegmentPayloadSize {
+	for len(src) > maxSegmentPayloadSize {
 		if f.compressor != nil {
-			tempBuf, err = newCompressedSegment(f.buf[:maxSegmentPayloadSize], false, f.compressor)
+			tempBuf, err = newCompressedSegment(src[:maxSegmentPayloadSize], false, f.compressor)
 		} else {
-			tempBuf, err = newUncompressedSegment(f.buf[:maxSegmentPayloadSize], false)
+			tempBuf, err = newUncompressedSegment(src[:maxSegmentPayloadSize], false)
 		}
 		if err != nil {
 			return err
 		}
 
 		adjustedBuf = append(adjustedBuf, tempBuf...)
-		f.buf = f.buf[maxSegmentPayloadSize:]
+		src = src[maxSegmentPayloadSize:]
 		selfContained = false
 	}
 
 	// Process the remaining buffer
 	if f.compressor != nil {
-		tempBuf, err = newCompressedSegment(f.buf, selfContained, f.compressor)
+		tempBuf, err = newCompressedSegment(src, selfContained, f.compressor)
 	} else {
-		tempBuf, err = newUncompressedSegment(f.buf, selfContained)
+		tempBuf, err = newUncompressedSegment(src, selfContained)
 	}
 	if err != nil {
 		return err

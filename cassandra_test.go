@@ -3509,7 +3509,7 @@ func TestQuery_WithNowInSeconds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	require.Equal(t, remainingTTL, 10)
+	require.Equal(t, 10, remainingTTL)
 }
 
 func TestQuery_SetKeyspace(t *testing.T) {
@@ -3524,7 +3524,7 @@ func TestQuery_SetKeyspace(t *testing.T) {
 	keyspaceStmt := fmt.Sprintf(`
 		CREATE KEYSPACE IF NOT EXISTS %s
 		WITH replication = {
-			'class': 'SimpleStrategy', 
+			'class': 'SimpleStrategy',
 			'replication_factor': '1'
 		};
 	`, keyspace)

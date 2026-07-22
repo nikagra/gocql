@@ -292,6 +292,40 @@ func Test_framer_writeBatchFrame(t *testing.T) {
 	assertDeepEqual(t, "nowInSeconds", nowInSeconds, framer.readInt())
 }
 
+// Test_framer_writeBatchFrame_unnamedValues guards the happy path through the
+// statement/values write loop (unnamed positional values), which must still
+// succeed after named-value rejection was hoisted out of that loop.
+func Test_framer_writeBatchFrame_unnamedValues(t *testing.T) {
+	framer := newFramer(nil, protoVersion5)
+	frame := writeBatchFrame{
+		typ:         LoggedBatch,
+		consistency: Quorum,
+		statements: []batchStatment{
+			{
+				statement: "INSERT INTO t (id, v) VALUES (?, ?)",
+				values: []queryValues{
+					{value: []byte{0, 0, 0, 1}},
+					{value: []byte("x")},
+				},
+			},
+		},
+	}
+
+	if err := framer.writeBatchFrame(1, &frame, frame.customPayload); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// skipping header
+	framer.buf = framer.buf[9:]
+	assertDeepEqual(t, "typ", frame.typ, BatchType(framer.readByte()))
+	assertDeepEqual(t, "len(statements)", len(frame.statements), int(framer.readShort()))
+	assertDeepEqual(t, "kind", byte(0), framer.readByte()) // 0 = raw query string
+	assertDeepEqual(t, "statement", frame.statements[0].statement, framer.readLongString())
+	assertDeepEqual(t, "len(values)", len(frame.statements[0].values), int(framer.readShort()))
+	assertDeepEqual(t, "value0", frame.statements[0].values[0].value, framer.readBytesCopy())
+	assertDeepEqual(t, "value1", frame.statements[0].values[1].value, framer.readBytesCopy())
+}
+
 // On protocols below v5 the keyspace override and now_in_seconds options are
 // not part of the wire format. The frame writers must reject them with an
 // explicit error (rather than silently dropping them, panicking, or leaving a
@@ -335,6 +369,12 @@ func Test_framer_writeBatchFrame_rejectsUnsupportedOptionsOnV4(t *testing.T) {
 		{"keyspace on v4", protoVersion4, writeBatchFrame{keyspace: "ks"}},
 		{"nowInSeconds on v4", protoVersion4, writeBatchFrame{nowInSeconds: &nowInSeconds}},
 		{"nowInSeconds overflow on v5", protoVersion5, writeBatchFrame{nowInSeconds: &overflow}},
+		{"named values on v4", protoVersion4, writeBatchFrame{
+			statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: []queryValues{{name: "id", value: []byte{1}}}}},
+		}},
+		{"named values on v5", protoVersion5, writeBatchFrame{
+			statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: []queryValues{{name: "id", value: []byte{1}}}}},
+		}},
 	}
 
 	for _, tc := range cases {
@@ -377,6 +417,11 @@ func Test_defaultFramerFlags(t *testing.T) {
 		{"v5 no compressor", nil, protoVersion5, frm.FlagBetaProtocol},
 		// v5 compresses at the segment layer, so no frame-header FlagCompress.
 		{"v5 with compressor", comp, protoVersion5, frm.FlagBetaProtocol},
+		// The version byte may carry the direction/reserved high bit (newFramer
+		// passes it unmasked). Masking must still resolve the beta flag and must not
+		// let the v5 check fall through and re-enable FlagCompress.
+		{"v5|dir with compressor", comp, protoVersion5 | protoDirectionMask, frm.FlagBetaProtocol},
+		{"v4|dir with compressor", comp, protoVersion4 | protoDirectionMask, frm.FlagCompress},
 	}
 
 	for _, tc := range cases {
@@ -437,12 +482,18 @@ func (m testMockedCompressor) AppendDecompressed(_, src []byte, decompressedLeng
 	return src, nil
 }
 
-func (m testMockedCompressor) AppendCompressedWithLength(dst, src []byte) ([]byte, error) {
-	panic("testMockedCompressor.AppendCompressedWithLength is not implemented")
+func (m testMockedCompressor) Encode(data []byte) ([]byte, error) {
+	if m.expectedError != nil {
+		return nil, m.expectedError
+	}
+	return data, nil
 }
 
-func (m testMockedCompressor) AppendDecompressedWithLength(dst, src []byte) ([]byte, error) {
-	panic("testMockedCompressor.AppendDecompressedWithLength is not implemented")
+func (m testMockedCompressor) Decode(data []byte) ([]byte, error) {
+	if m.expectedError != nil {
+		return nil, m.expectedError
+	}
+	return data, nil
 }
 
 func Test_readUncompressedFrame(t *testing.T) {
@@ -666,5 +717,113 @@ func TestParseEventFrame_ClientRoutesChanged(t *testing.T) {
 	}
 	if len(evt.HostIDs) != 0 {
 		t.Fatalf("HostIDs = %v, want empty", evt.HostIDs)
+	}
+}
+
+// failingCompressor compresses by copying (append semantics), but returns an
+// error on the (failAt)th AppendCompressed call (1-indexed). It lets a test
+// force prepareModernLayout to fail partway through multi-segment framing.
+type failingCompressor struct {
+	failAt int
+	calls  int
+}
+
+func (c *failingCompressor) Name() string { return "failing" }
+
+func (c *failingCompressor) AppendCompressed(dst, src []byte) ([]byte, error) {
+	c.calls++
+	if c.calls == c.failAt {
+		return nil, errors.New("compress boom")
+	}
+	return append(dst, src...), nil
+}
+
+func (c *failingCompressor) AppendDecompressed(dst, src []byte, _ uint32) ([]byte, error) {
+	return append(dst, src...), nil
+}
+
+func (c *failingCompressor) Encode(data []byte) ([]byte, error) {
+	return data, nil
+}
+
+func (c *failingCompressor) Decode(data []byte) ([]byte, error) {
+	return data, nil
+}
+
+// TestPrepareModernLayoutLeavesBufIntactOnError verifies that when segmentation
+// fails partway through a multi-segment frame, framer.buf is left byte-for-byte
+// unchanged so the caller can safely release the framer.
+func TestPrepareModernLayoutLeavesBufIntactOnError(t *testing.T) {
+	t.Parallel()
+
+	// A payload spanning more than one maxSegmentPayloadSize chunk forces the
+	// chunk loop to run, so failing on the second AppendCompressed call fails
+	// after the first chunk has already been appended to the local buffer.
+	original := bytes.Repeat([]byte{0xAB}, maxSegmentPayloadSize+100)
+
+	f := newFramer(&failingCompressor{failAt: 2}, protoVersion5)
+	f.buf = append([]byte(nil), original...)
+
+	err := f.prepareModernLayout()
+	if err == nil {
+		t.Fatal("expected prepareModernLayout to fail")
+	}
+	if !bytes.Equal(f.buf, original) {
+		t.Fatalf("f.buf was mutated on error: len=%d, want len=%d", len(f.buf), len(original))
+	}
+}
+
+// TestPrepareModernLayoutRejectsPreV5ProtocolWithError verifies that calling
+// prepareModernLayout on a framer negotiated below protocol v5 returns an
+// error instead of panicking, since the function's contract is to report
+// every failure mode (including this internal precondition) via its error
+// return.
+func TestPrepareModernLayoutRejectsPreV5ProtocolWithError(t *testing.T) {
+	t.Parallel()
+
+	f := newFramer(nil, protoVersion4)
+	f.buf = append([]byte(nil), []byte("some frame bytes")...)
+
+	require.NotPanics(t, func() {
+		err := f.prepareModernLayout()
+		require.Error(t, err)
+	})
+}
+
+// TestPrepareModernLayoutSuccessUnchanged guards that the local-cursor refactor
+// did not change the segmented output on the success path.
+func TestPrepareModernLayoutSuccessUnchanged(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{1, maxSegmentPayloadSize - 1, maxSegmentPayloadSize, maxSegmentPayloadSize + 1, 2*maxSegmentPayloadSize + 7} {
+		original := bytes.Repeat([]byte{0x5A}, size)
+
+		// Reference output computed directly from the segment helpers.
+		var want []byte
+		src := original
+		selfContained := true
+		for len(src) > maxSegmentPayloadSize {
+			seg, err := newUncompressedSegment(src[:maxSegmentPayloadSize], false)
+			if err != nil {
+				t.Fatalf("size %d: reference segment: %v", size, err)
+			}
+			want = append(want, seg...)
+			src = src[maxSegmentPayloadSize:]
+			selfContained = false
+		}
+		seg, err := newUncompressedSegment(src, selfContained)
+		if err != nil {
+			t.Fatalf("size %d: reference tail segment: %v", size, err)
+		}
+		want = append(want, seg...)
+
+		f := newFramer(nil, protoVersion5)
+		f.buf = append([]byte(nil), original...)
+		if err := f.prepareModernLayout(); err != nil {
+			t.Fatalf("size %d: prepareModernLayout: %v", size, err)
+		}
+		if !bytes.Equal(f.buf, want) {
+			t.Fatalf("size %d: segmented output changed", size)
+		}
 	}
 }
