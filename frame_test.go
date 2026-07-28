@@ -32,6 +32,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -361,27 +362,83 @@ func Test_framer_writeBatchFrame_rejectsUnsupportedOptionsOnV4(t *testing.T) {
 	nowInSeconds := 123
 	overflow := math.MaxInt32 + 1
 
+	namedValues := []queryValues{{name: "id", value: []byte{1}}}
+
+	// wantErr pins which validation rejected the frame, so a case cannot pass by
+	// tripping some unrelated error.
 	cases := []struct {
-		name  string
-		proto byte
-		frame writeBatchFrame
+		name    string
+		proto   byte
+		frame   writeBatchFrame
+		wantErr string
 	}{
-		{"keyspace on v4", protoVersion4, writeBatchFrame{keyspace: "ks"}},
-		{"nowInSeconds on v4", protoVersion4, writeBatchFrame{nowInSeconds: &nowInSeconds}},
-		{"nowInSeconds overflow on v5", protoVersion5, writeBatchFrame{nowInSeconds: &overflow}},
-		{"named values on v4", protoVersion4, writeBatchFrame{
-			statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: []queryValues{{name: "id", value: []byte{1}}}}},
-		}},
-		{"named values on v5", protoVersion5, writeBatchFrame{
-			statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: []queryValues{{name: "id", value: []byte{1}}}}},
-		}},
+		{
+			name:    "keyspace on v4",
+			proto:   protoVersion4,
+			frame:   writeBatchFrame{keyspace: "ks"},
+			wantErr: "keyspace override can only be set with protocol v5 or higher",
+		},
+		{
+			name:    "nowInSeconds on v4",
+			proto:   protoVersion4,
+			frame:   writeBatchFrame{nowInSeconds: &nowInSeconds},
+			wantErr: "now_in_seconds can only be set with protocol v5 or higher",
+		},
+		{
+			name:    "nowInSeconds overflow on v5",
+			proto:   protoVersion5,
+			frame:   writeBatchFrame{nowInSeconds: &overflow},
+			wantErr: "overflows int32",
+		},
+		// Named values are rejected on every protocol version (CASSANDRA-10246),
+		// for both raw-statement and prepared-id batch entries.
+		{
+			name:  "named values on v4",
+			proto: protoVersion4,
+			frame: writeBatchFrame{
+				statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: namedValues}},
+			},
+			wantErr: "named query values are not supported in batches",
+		},
+		{
+			name:  "named values on v5",
+			proto: protoVersion5,
+			frame: writeBatchFrame{
+				statements: []batchStatment{{statement: "INSERT INTO t (id) VALUES (?)", values: namedValues}},
+			},
+			wantErr: "named query values are not supported in batches",
+		},
+		{
+			name:  "named values on a prepared statement",
+			proto: protoVersion5,
+			frame: writeBatchFrame{
+				statements: []batchStatment{{preparedID: []byte{0xAA, 0xBB}, values: namedValues}},
+			},
+			wantErr: "named query values are not supported in batches",
+		},
+		{
+			// The rejection must scan every statement, not just the first.
+			name:  "named values in a later statement",
+			proto: protoVersion5,
+			frame: writeBatchFrame{
+				statements: []batchStatment{
+					{statement: "INSERT INTO t (id) VALUES (?)", values: []queryValues{{value: []byte{1}}}},
+					{statement: "INSERT INTO u (id) VALUES (?)", values: namedValues},
+				},
+			},
+			wantErr: "named query values are not supported in batches",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			framer := newFramer(nil, tc.proto)
-			if err := framer.writeBatchFrame(1, &tc.frame, tc.frame.customPayload); err == nil {
+			err := framer.writeBatchFrame(1, &tc.frame, tc.frame.customPayload)
+			if err == nil {
 				t.Fatal("expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not contain %q", err, tc.wantErr)
 			}
 			if len(framer.buf) != 0 {
 				t.Fatalf("expected framer buffer to be untouched on error, got %d bytes", len(framer.buf))
