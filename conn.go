@@ -457,6 +457,15 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	return c.w.writeContext(context.Background(), p)
 }
 
+// Read reads data from the connection.
+//
+// The driver itself reads through the connection's ConnReader (which owns the
+// read-deadline handling); Read is retained so that *Conn keeps satisfying
+// io.Reader for external callers, as it does io.Writer via Write.
+func (c *Conn) Read(p []byte) (n int, err error) {
+	return c.r.Read(p)
+}
+
 type startupCoordinator struct {
 	conn        *Conn
 	frameTicker chan struct{}
@@ -1197,27 +1206,40 @@ type connReader struct {
 }
 
 func (c *connReader) Read(p []byte) (n int, err error) {
-	if c.conn != nil {
-		if c.disarm.Load() {
-			// The read deadline is disarmed around the frame/segment header read in
-			// the serve() loop: on an idle connection that read blocks indefinitely
-			// waiting for the next frame, so a short ReadTimeout must not fire here.
-			// We disarm via this flag rather than by zeroing the operational timeout
-			// so that a concurrent finalizeConnection (which switches the reader from
-			// ConnectTimeout to ReadTimeout) is never clobbered by a restore.
-			c.conn.SetReadDeadline(time.Time{})
-		} else if timeout := c.GetTimeout(); timeout > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(timeout))
-		} else {
-			// A read deadline is absolute and persists across reads: once the
-			// timeout is disabled we must clear any deadline armed by a previous
-			// read (or during connection setup, e.g. ConnectTimeout), otherwise
-			// idle connections keep tripping the stale deadline.
-			c.conn.SetReadDeadline(time.Time{})
-		}
+	if err = c.armDeadline(); err != nil {
+		return 0, err
 	}
 	n, err = io.ReadFull(c.r, p)
 	return
+}
+
+// armDeadline arms (or clears) the underlying read deadline for the read that is
+// about to start. The setter error is returned rather than dropped: a net.Conn
+// whose SetReadDeadline fails would otherwise be read with no deadline at all,
+// or with a stale one from an earlier read. This mirrors the write path, where
+// deadlineContextWriter.writeContext and writeCoalescer.flush both report
+// SetWriteDeadline failures instead of writing anyway.
+func (c *connReader) armDeadline() error {
+	if c.conn == nil {
+		return nil
+	}
+	if c.disarm.Load() {
+		// The read deadline is disarmed around the frame/segment header read in
+		// the serve() loop: on an idle connection that read blocks indefinitely
+		// waiting for the next frame, so a short ReadTimeout must not fire here.
+		// We disarm via this flag rather than by zeroing the operational timeout
+		// so that a concurrent finalizeConnection (which switches the reader from
+		// ConnectTimeout to ReadTimeout) is never clobbered by a restore.
+		return c.conn.SetReadDeadline(time.Time{})
+	}
+	if timeout := c.GetTimeout(); timeout > 0 {
+		return c.conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+	// A read deadline is absolute and persists across reads: once the timeout is
+	// disabled we must clear any deadline armed by a previous read (or during
+	// connection setup, e.g. ConnectTimeout), otherwise idle connections keep
+	// tripping the stale deadline.
+	return c.conn.SetReadDeadline(time.Time{})
 }
 
 // setDisarm enables or disables the read-deadline disarm used around the

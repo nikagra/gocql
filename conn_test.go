@@ -2818,18 +2818,21 @@ func TestRecvSegmentDisarmsReadDeadlineOnIdleConn(t *testing.T) {
 
 // nonBlockingDeadlineConn is a net.Conn that records SetReadDeadline calls and
 // returns immediately from Read, so a single connReader.Read can be exercised
-// synchronously.
+// synchronously. setDeadlineErr, when set, makes SetReadDeadline fail; reads
+// counts the Read calls that actually reached the connection.
 type nonBlockingDeadlineConn struct {
-	deadlines []time.Time
+	setDeadlineErr error
+	deadlines      []time.Time
+	reads          int
 }
 
 var _ net.Conn = (*nonBlockingDeadlineConn)(nil)
 
 func (c *nonBlockingDeadlineConn) SetReadDeadline(t time.Time) error {
 	c.deadlines = append(c.deadlines, t)
-	return nil
+	return c.setDeadlineErr
 }
-func (c *nonBlockingDeadlineConn) Read(p []byte) (int, error)         { return 0, io.EOF }
+func (c *nonBlockingDeadlineConn) Read(p []byte) (int, error)         { c.reads++; return 0, io.EOF }
 func (c *nonBlockingDeadlineConn) Write(p []byte) (int, error)        { return 0, io.ErrClosedPipe }
 func (c *nonBlockingDeadlineConn) Close() error                       { return nil }
 func (c *nonBlockingDeadlineConn) LocalAddr() net.Addr                { return nil }
@@ -2877,6 +2880,57 @@ func TestConnReaderReadWithNilConnAndPositiveTimeoutDoesNotPanic(t *testing.T) {
 		buf := make([]byte, 1)
 		_, _ = cr.Read(buf)
 	})
+}
+
+// TestConnReaderReadReturnsDeadlineError verifies that connReader.Read reports a
+// failing SetReadDeadline instead of reading with no deadline (or a stale one),
+// matching the write path (deadlineContextWriter.writeContext). All three
+// deadline branches are covered: disarmed, positive timeout, disabled timeout.
+func TestConnReaderReadReturnsDeadlineError(t *testing.T) {
+	t.Parallel()
+
+	setDeadlineErr := errors.New("set read deadline failed")
+
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+		disarm  bool
+	}{
+		{name: "disarmed", timeout: 5 * time.Second, disarm: true},
+		{name: "positive timeout", timeout: 5 * time.Second},
+		{name: "timeout disabled", timeout: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mock := &nonBlockingDeadlineConn{setDeadlineErr: setDeadlineErr}
+			cr := &connReader{conn: mock, r: bufio.NewReader(mock)}
+			cr.SetTimeout(tc.timeout)
+			cr.setDisarm(tc.disarm)
+
+			n, err := cr.Read(make([]byte, 1))
+			require.ErrorIs(t, err, setDeadlineErr)
+			require.Zero(t, n)
+			require.Zero(t, mock.reads,
+				"Read must not touch the connection once arming the deadline failed")
+		})
+	}
+}
+
+// TestConnReadDelegatesToConnReader verifies that the exported (*Conn).Read is
+// wired to the connection's ConnReader, so *Conn keeps satisfying io.Reader for
+// external callers after the ConnReader refactor.
+func TestConnReadDelegatesToConnReader(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	c := &Conn{r: &connReader{r: bufio.NewReader(bytes.NewReader(payload))}}
+
+	buf := make([]byte, len(payload))
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+	require.Equal(t, payload, buf)
 }
 
 // TestRecvSegmentReassemblesFrameWithSplitHeader verifies that recvSegment
