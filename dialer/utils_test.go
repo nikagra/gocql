@@ -31,3 +31,57 @@ func TestGetFrameHashEmpty(t *testing.T) {
 		t.Fatalf("GetFrameHash(nil) = %d, want %d", got, murmur.Murmur3H1(nil))
 	}
 }
+
+// executeFrameV4 builds a minimal protocol v4 EXECUTE request frame. version is
+// taken as-is so callers can set the request/response direction bit.
+//
+//	header: version, flags, stream(2), opcode, length(4)   -> body starts at 9
+//	body:   preparedID [short bytes], consistency [short], query flags [byte]
+func executeFrameV4(version byte) []byte {
+	body := []byte{
+		0x00, 0x02, 0xAA, 0xBB, // preparedID: 2-byte length + 2 bytes
+		0x00, 0x01, // consistency = ONE
+		0x00, // query flags: none set
+	}
+
+	frame := []byte{
+		version,
+		0x00,       // no header flags (notably no custom payload)
+		0x00, 0x7B, // stream id
+		byte(opExecute),
+		0x00, 0x00, 0x00, byte(len(body)),
+	}
+
+	return append(frame, body...)
+}
+
+// TestGetFrameHashIgnoresDirectionBit pins that every protocol-version
+// comparison in GetFrameHash masks off the direction bit before comparing.
+//
+// The version tests used to be a mix of masked and unmasked. The unmasked ones
+// read 0x84 (v4 with the direction bit set) as "greater than v4", i.e. as v5, so
+// they took the v5-only branches: the EXECUTE parser skipped a resultMetadataID
+// that is not on the wire and addQueryParams read a 4-byte flags field instead of
+// a 1-byte one. Both walk the offsets off the end of the body, so before the fix
+// the 0x84 case panicked instead of producing the v4 hash.
+func TestGetFrameHashIgnoresDirectionBit(t *testing.T) {
+	plain := executeFrameV4(0x04)
+	directionBitSet := executeFrameV4(0x04 | 0x80)
+
+	got := GetFrameHash(plain)
+	withBit := GetFrameHash(directionBitSet)
+
+	if got != withBit {
+		t.Errorf("direction bit changed the hash: 0x04 -> %d, 0x84 -> %d", got, withBit)
+	}
+
+	// Also confirm the frame was really parsed, rather than diverted to the
+	// raw-bytes fallback: the hash must cover just the query-params range.
+	want := murmur.Murmur3H1(plain[9:])
+	if got != want {
+		t.Errorf("GetFrameHash(v4 EXECUTE) = %d, want body hash %d", got, want)
+	}
+	if raw := murmur.Murmur3H1(plain); got == raw {
+		t.Error("GetFrameHash fell back to hashing the raw frame")
+	}
+}
