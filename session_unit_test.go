@@ -4185,3 +4185,93 @@ func TestQueryKeyspaceConcurrentWithRoutingInfoWrite(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestResolveRoutingKeyspaceTable pins the precedence used to pick the keyspace
+// and table a prepared statement targets. The default (SetKeyspace override or
+// Cluster.Keyspace) must never shadow the per-column metadata: routingKeyInfo
+// seeds its keyspace variable with that default in order to build the cache key,
+// and if the default won, a statement against another keyspace's table would be
+// routed with the session keyspace and get the wrong partitioner.
+func TestResolveRoutingKeyspaceTable(t *testing.T) {
+	t.Parallel()
+
+	col := func(ks, tbl string) []ColumnInfo {
+		return []ColumnInfo{{Keyspace: ks, Table: tbl, Name: "id"}}
+	}
+
+	tests := []struct {
+		name         string
+		meta         preparedMetadata
+		def          string
+		wantKeyspace string
+		wantTable    string
+	}{
+		{
+			name:         "global table spec wins over the default",
+			meta:         preparedMetadata{keyspace: "global_ks", table: "global_tbl"},
+			def:          "session_ks",
+			wantKeyspace: "global_ks",
+			wantTable:    "global_tbl",
+		},
+		{
+			name: "global table spec wins over per-column metadata",
+			meta: preparedMetadata{
+				keyspace:       "global_ks",
+				table:          "global_tbl",
+				resultMetadata: resultMetadata{columns: col("column_ks", "column_tbl")},
+			},
+			def:          "session_ks",
+			wantKeyspace: "global_ks",
+			wantTable:    "global_tbl",
+		},
+		{
+			// The regression this helper exists for: no global table spec, so the
+			// keyspace must come from the columns and not from the session default.
+			name: "per-column metadata wins over the default",
+			meta: preparedMetadata{
+				resultMetadata: resultMetadata{columns: col("column_ks", "column_tbl")},
+			},
+			def:          "session_ks",
+			wantKeyspace: "column_ks",
+			wantTable:    "column_tbl",
+		},
+		{
+			name: "per-column keyspace fills in a partial global spec",
+			meta: preparedMetadata{
+				table:          "global_tbl",
+				resultMetadata: resultMetadata{columns: col("column_ks", "column_tbl")},
+			},
+			def:          "session_ks",
+			wantKeyspace: "column_ks",
+			wantTable:    "global_tbl",
+		},
+		{
+			name:         "default is the last resort",
+			meta:         preparedMetadata{},
+			def:          "session_ks",
+			wantKeyspace: "session_ks",
+			wantTable:    "",
+		},
+		{
+			name:         "no source at all yields empty",
+			meta:         preparedMetadata{},
+			def:          "",
+			wantKeyspace: "",
+			wantTable:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			keyspace, table := resolveRoutingKeyspaceTable(&tt.meta, tt.def)
+			if keyspace != tt.wantKeyspace {
+				t.Errorf("keyspace = %q, want %q", keyspace, tt.wantKeyspace)
+			}
+			if table != tt.wantTable {
+				t.Errorf("table = %q, want %q", table, tt.wantTable)
+			}
+		})
+	}
+}

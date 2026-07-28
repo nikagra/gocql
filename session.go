@@ -820,6 +820,38 @@ func (s *Session) findTabletReplicasUnsafeForToken(keyspace, table string, token
 	return md.metadata.tabletsMetadata.FindReplicasUnsafeForToken(keyspace, table, token)
 }
 
+// resolveRoutingKeyspaceTable determines which keyspace and table a prepared
+// statement actually targets, for the purpose of picking a partitioner and
+// reading table metadata.
+//
+// The order matters. The prepared metadata's global table spec is authoritative.
+// When FlagGlobalTableSpec is not set the server carries the keyspace/table per
+// column instead, so the first column is the next best source. def (the
+// statement's SetKeyspace override, or else Cluster.Keyspace) is only a last
+// resort: letting it take precedence over the per-column metadata would route a
+// statement that targets another keyspace's table using the session keyspace,
+// yielding the wrong partitioner or a metadata lookup failure.
+//
+// table has no def fallback — there is no session-level default table.
+func resolveRoutingKeyspaceTable(meta *preparedMetadata, def string) (keyspace, table string) {
+	keyspace, table = meta.keyspace, meta.table
+
+	if len(meta.columns) > 0 {
+		if keyspace == "" {
+			keyspace = meta.columns[0].Keyspace
+		}
+		if table == "" {
+			table = meta.columns[0].Table
+		}
+	}
+
+	if keyspace == "" {
+		keyspace = def
+	}
+
+	return keyspace, table
+}
+
 // Returns routing key indexes and type info.
 // If keyspace == "" it uses the keyspace which is specified in Cluster.Keyspace
 func (s *Session) routingKeyInfo(ctx context.Context, stmt string, keyspace string, requestTimeout time.Duration) (*routingKeyInfo, error) {
@@ -888,22 +920,14 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string, keyspace stri
 		return nil, nil
 	}
 
-	table := info.request.table
-	if info.request.keyspace != "" {
-		keyspace = info.request.keyspace
-	}
-
-	// Fall back to per-column metadata when FlagGlobalTableSpec is not set.
-	if keyspace == "" && len(info.request.columns) > 0 {
-		keyspace = info.request.columns[0].Keyspace
-	}
-	if table == "" && len(info.request.columns) > 0 {
-		table = info.request.columns[0].Table
-	}
+	// Resolve the statement's real target from the prepared metadata. Note this
+	// reassigns keyspace: routingKeyInfoCacheKey was already built from the
+	// requested keyspace above and is unaffected.
+	keyspace, table := resolveRoutingKeyspaceTable(&info.request, keyspace)
 
 	partitioner, err := scyllaGetTablePartitioner(s, keyspace, table)
 	if err != nil {
-		// don't cache this error
+		// don't cache this error, but make sure all waiters see the same failure.
 		inflight.err = err
 		s.routingKeyInfoCache.Remove(routingKeyInfoCacheKey)
 		return nil, inflight.err
