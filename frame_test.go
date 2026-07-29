@@ -226,6 +226,91 @@ type errReader struct{ err error }
 
 func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
+// TestParseResultMetadata_PagingStateBeforeNewMetadataID pins the wire order of
+// the two optional fields in a v5 RESULT/Rows <metadata> block.
+//
+// With only one of HAS_MORE_PAGES / METADATA_CHANGED set, either ordering parses
+// identically, so no other test in this repo can tell them apart. Only a frame
+// carrying both distinguishes them, and such a frame is hard to obtain from a
+// live server (it needs the client to execute with a stale result_metadata_id
+// while a page boundary falls in the same response). Synthesising it here is
+// both deterministic and stronger than an integration test.
+//
+// The layout asserted below is the one Cassandra actually emits, read out of
+// ResultSet$ResultMetadata$Codec.encode in the 5.0.6 distribution:
+//
+//	writeInt(flags)
+//	writeInt(columnCount)
+//	if HAS_MORE_PAGES:                CBUtil.writeValue(pagingState)    // [bytes]
+//	if v5+ && METADATA_CHANGED:       CBUtil.writeBytes(resultMetadataId) // [short bytes]
+//	if !NO_METADATA:                  global table spec / column specs
+//
+// Note the differing wire types: paging state is [bytes] (4-byte length) and the
+// metadata id is [short bytes] (2-byte length), so swapping the two reads
+// desynchronises the rest of the block rather than merely exchanging the values.
+func TestParseResultMetadata_PagingStateBeforeNewMetadataID(t *testing.T) {
+	t.Parallel()
+
+	const (
+		keyspace = "test_ks"
+		table    = "test_tbl"
+	)
+	pagingState := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01}
+	newMetadataID := []byte{0xAA, 0xBB, 0xCC}
+
+	fr := newFramer(nil, protoVersion5)
+	fr.header = &frm.FrameHeader{Version: protoVersion5}
+
+	fr.writeInt(int32(frm.FlagGlobalTableSpec | frm.FlagHasMorePages | frm.FlagMetaDataChanged))
+	fr.writeInt(1) // colCount
+	fr.writeBytes(pagingState)
+	fr.writeShortBytes(newMetadataID)
+	fr.writeString(keyspace)
+	fr.writeString(table)
+	fr.writeString("col_a")
+	fr.writeShort(uint16(TypeInt))
+
+	meta := fr.parseResultMetadata()
+
+	assertDeepEqual(t, "pagingState", pagingState, meta.pagingState)
+	assertDeepEqual(t, "newMetadataID", newMetadataID, meta.newMetadataID)
+
+	// The column spec must still be readable, which is what actually proves the
+	// two optional fields were consumed in the right order and with the right
+	// wire types.
+	require.Len(t, meta.columns, 1)
+	require.Equal(t, keyspace, meta.columns[0].Keyspace)
+	require.Equal(t, table, meta.columns[0].Table)
+	require.Equal(t, "col_a", meta.columns[0].Name)
+	require.Empty(t, fr.buf, "whole metadata block should be consumed")
+}
+
+// TestParseResultMetadata_NewMetadataIDIgnoredBelowV5 pins that the
+// METADATA_CHANGED field is only on the wire from v5 onwards: on v4 the flag bit
+// must not cause a read, or the parser would consume bytes that belong to the
+// column specs.
+func TestParseResultMetadata_NewMetadataIDIgnoredBelowV5(t *testing.T) {
+	t.Parallel()
+
+	fr := newFramer(nil, protoVersion4)
+	fr.header = &frm.FrameHeader{Version: protoVersion4}
+
+	// METADATA_CHANGED set but no id on the wire, as a v4 server would send.
+	fr.writeInt(int32(frm.FlagGlobalTableSpec | frm.FlagMetaDataChanged))
+	fr.writeInt(1)
+	fr.writeString("test_ks")
+	fr.writeString("test_tbl")
+	fr.writeString("col_a")
+	fr.writeShort(uint16(TypeInt))
+
+	meta := fr.parseResultMetadata()
+
+	require.Nil(t, meta.newMetadataID, "no metadata id should be read below v5")
+	require.Len(t, meta.columns, 1)
+	require.Equal(t, "col_a", meta.columns[0].Name)
+	require.Empty(t, fr.buf, "whole metadata block should be consumed")
+}
+
 func TestParseResultMetadata_PerColumnSpec(t *testing.T) {
 	t.Parallel()
 

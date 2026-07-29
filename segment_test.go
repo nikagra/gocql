@@ -24,11 +24,62 @@ package gocql
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"runtime"
 	"testing"
 
 	"github.com/gocql/gocql/internal/crc"
 )
+
+// The four helpers below build or read one whole segment in a single call, each
+// with buffers of its own. The driver itself never works a segment at a time: the
+// receive loop reads a header and a payload in two phases so it can re-arm the
+// read deadline in between (and shares one segmentScratch across segments), and
+// the send path encodes segments directly into the framer's wire buffer. So these
+// live here rather than in segment.go — they exist for the tests, and they model
+// an allocation contract the production code deliberately does not follow.
+
+// readUncompressedSegment reads a full uncompressed segment (header + payload) in
+// one call, into a payload buffer of its own.
+func readUncompressedSegment(r io.Reader) ([]byte, bool, error) {
+	var scratch segmentScratch
+
+	h, err := readUncompressedSegmentHeader(r)
+	if err != nil {
+		return nil, false, err
+	}
+	payload, err := readUncompressedSegmentPayload(r, h, &scratch)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, h.isSelfContained, nil
+}
+
+// readCompressedSegment reads a full compressed segment (header + payload) in one
+// call, into payload buffers of its own.
+func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, error) {
+	var scratch segmentScratch
+
+	h, err := readCompressedSegmentHeader(r)
+	if err != nil {
+		return nil, false, err
+	}
+	payload, err := readCompressedSegmentPayload(r, h, compressor, &scratch)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, h.isSelfContained, nil
+}
+
+// newUncompressedSegment returns payload as a standalone uncompressed segment.
+func newUncompressedSegment(payload []byte, isSelfContained bool) ([]byte, error) {
+	return appendUncompressedSegment(nil, payload, isSelfContained)
+}
+
+// newCompressedSegment returns payload as a standalone compressed segment.
+func newCompressedSegment(payload []byte, isSelfContained bool, compressor Compressor) ([]byte, error) {
+	return appendCompressedSegment(nil, payload, isSelfContained, compressor)
+}
 
 // makeCompressedSegmentHeaderRaw builds a valid 5-byte compressed-segment
 // header (with a correct CRC24) from a raw 40-bit combined value, without any

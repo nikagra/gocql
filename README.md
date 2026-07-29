@@ -286,16 +286,26 @@ config.Compressor = &lz4.LZ4Compressor{}
 ...
 ```
 
-LZ4 support is provided as an optional sub-module. Because it uses the same fork pattern as
-the parent module, add a second `replace` directive alongside the one from the Installation
-section (following the same `<version>` convention):
+LZ4 support is provided as an optional sub-module with its own `go.mod`. Because it uses the
+same fork pattern as the parent module, add a second `replace` directive alongside the one from
+the Installation section:
 
 ```mod
 replace github.com/gocql/gocql => github.com/scylladb/gocql <version>
-replace github.com/gocql/gocql/lz4 => github.com/scylladb/gocql/lz4 <version>
+replace github.com/gocql/gocql/lz4 => github.com/scylladb/gocql/lz4 <lz4-version>
 ```
 
-Replace `<version>` with concrete released tags (or pseudo-versions), then run `go mod tidy`.
+The two versions are independent, and `<lz4-version>` cannot be a release tag today: Go resolves
+a version of a sub-directory module through a tag prefixed with that subdirectory, so `v1.7.3`
+is looked up as the tag `lz4/v1.7.3`. This repository publishes no `lz4/v*` tags, so such a
+directive fails with `invalid version: unknown revision lz4/v1.7.3`. Use a pseudo-version
+instead — this prints one for the current `master`:
+
+```sh
+go list -m github.com/scylladb/gocql/lz4@master   # or @<commit-sha>
+```
+
+Then run `go mod tidy`.
 
 ## 6. Contributing
 

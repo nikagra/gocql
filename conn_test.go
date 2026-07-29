@@ -2490,9 +2490,35 @@ func TestReleaseFramer(t *testing.T) {
 	})
 }
 
+// segmentTestTimeout bounds every wait in the v5 segment tests. It has to be
+// generous enough for a loaded -race runner, but finite: an unbounded receive
+// would turn a lost response into a whole-package `go test -timeout` kill instead
+// of a failure pointing at the test.
+const segmentTestTimeout = 10 * time.Second
+
+// recvCallResp waits for a response to be delivered to call, failing the test on
+// the test goroutine if it never arrives. Assertions must not run on a child
+// goroutine: require's FailNow is only valid on the test goroutine, and a test
+// that does not wait for its own assertions can return while they are still in
+// flight — a genuine mismatch is then dropped or reported as a panic after the
+// test completed.
+func recvCallResp(t *testing.T, call *callReq) callResp {
+	t.Helper()
+
+	select {
+	case resp := <-call.resp:
+		return resp
+	case <-time.After(segmentTestTimeout):
+		t.Fatalf("timed out waiting for a response on stream %d", call.streamID)
+		return callResp{}
+	}
+}
+
 func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 	server, client, err := tcpConnPair()
 	require.NoError(t, err)
+	defer server.Close()
+	defer client.Close()
 
 	w := &deadlineContextWriter{
 		w:         server,
@@ -2511,6 +2537,7 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 		addr:       server.RemoteAddr().String(),
 		streams:    streams.New(),
 		isSchemaV2: true,
+		logger:     nopLogger{},
 		w:          w,
 	}
 	c.writeTimeout.Store(int64(time.Second * 10))
@@ -2546,19 +2573,20 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 	err = req.buildFrame(framer2, 2)
 	require.NoError(t, err)
 
-	go func() {
-		var buf []byte
-		buf = append(buf, framer1.buf...)
-		buf = append(buf, framer2.buf...)
+	// Write from the test goroutine: this is a real loopback socket, and the two
+	// frames plus the segment header and CRC are ~124 bytes, so the write completes
+	// into the socket buffer without a reader.
+	var buf []byte
+	buf = append(buf, framer1.buf...)
+	buf = append(buf, framer2.buf...)
 
-		uncompressedSegment, err := newUncompressedSegment(buf, true)
-		require.NoError(t, err)
+	uncompressedSegment, err := newUncompressedSegment(buf, true)
+	require.NoError(t, err)
 
-		_, err = client.Write(uncompressedSegment)
-		require.NoError(t, err)
-	}()
+	_, err = client.Write(uncompressedSegment)
+	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), segmentTestTimeout)
 	defer cancel()
 
 	errCh := make(chan error, 1)
@@ -2566,23 +2594,23 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 		errCh <- c.recvSegment(ctx)
 	}()
 
-	go func() {
-		resp1 := <-call1.resp
-		close(call1.timeout)
-		// Skipping here the header of the frame because resp.framer contains already parsed header
-		// and resp.framer.buf contains frame body
-		require.Equal(t, framer1.buf[9:], resp1.framer.buf)
+	// Receive in segment order: processAllFramesInSegment consumes the frames
+	// sequentially and each send is on an unbuffered channel, so frame 1 is fully
+	// delivered before frame 2 starts.
+	//
+	// The header is skipped because resp.framer has already parsed it; framer.buf
+	// holds the body only.
+	resp1 := recvCallResp(t, call1)
+	require.Equal(t, framer1.buf[9:], resp1.framer.buf)
 
-		resp2 := <-call2.resp
-		close(call2.timeout)
-		require.Equal(t, framer2.buf[9:], resp2.framer.buf)
-	}()
+	resp2 := recvCallResp(t, call2)
+	require.Equal(t, framer2.buf[9:], resp2.framer.buf)
 
 	select {
-	case <-ctx.Done():
-		t.Fatal("Timed out waiting for frames")
 	case err := <-errCh:
 		require.NoError(t, err)
+	case <-time.After(segmentTestTimeout):
+		t.Fatal("recvSegment did not return after delivering both frames")
 	}
 }
 
@@ -2639,34 +2667,33 @@ func TestConnProcessReservedStreamFrameInSegment(t *testing.T) {
 	framer2 := newFramer(nil, protoVersion5)
 	require.NoError(t, req.buildFrame(framer2, 2))
 
-	go func() {
-		var buf []byte
-		buf = append(buf, reservedFramer.buf...)
-		buf = append(buf, framer2.buf...)
+	// Written from the test goroutine; see TestConnProcessAllFramesInSingleSegment.
+	var buf []byte
+	buf = append(buf, reservedFramer.buf...)
+	buf = append(buf, framer2.buf...)
 
-		seg, err := newUncompressedSegment(buf, true)
-		require.NoError(t, err)
-		_, err = client.Write(seg)
-		require.NoError(t, err)
-	}()
+	seg, err := newUncompressedSegment(buf, true)
+	require.NoError(t, err)
+	_, err = client.Write(seg)
+	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), segmentTestTimeout)
 	defer cancel()
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.recvSegment(ctx) }()
 
-	go func() {
-		resp2 := <-call2.resp
-		close(call2.timeout)
-		require.Equal(t, framer2.buf[9:], resp2.framer.buf)
-	}()
+	// This is the assertion the test exists for: if the reserved frame's body had
+	// been read from the socket instead of the segment payload, the segment reader
+	// would be misaligned and this response would never arrive (or arrive corrupt).
+	resp2 := recvCallResp(t, call2)
+	require.Equal(t, framer2.buf[9:], resp2.framer.buf)
 
 	select {
-	case <-ctx.Done():
-		t.Fatal("timed out; reserved-stream frame body was likely read from the socket, not the segment")
 	case err := <-errCh:
 		require.NoError(t, err)
+	case <-time.After(segmentTestTimeout):
+		t.Fatal("recvSegment did not return; reserved-stream frame body was likely read from the socket, not the segment")
 	}
 }
 
