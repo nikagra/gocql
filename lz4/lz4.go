@@ -27,9 +27,20 @@ package lz4
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/pierrec/lz4/v4"
 )
+
+// compressorPool pools the lz4 compression state. lz4.Compressor carries the
+// match hash table it reuses between blocks — ~136 KiB — so declaring one per
+// call would allocate and zero that for every frame (on protocol v5, for every
+// 128 KiB segment of every frame). It holds no reference to the source or
+// destination buffers, so one instance is reusable for any input; the pool only
+// exists to keep concurrent compressions from sharing a table.
+var compressorPool = sync.Pool{
+	New: func() any { return new(lz4.Compressor) },
+}
 
 // LZ4Compressor implements the gocql.Compressor interface (and, for native
 // protocol v5 segment compression, gocql.SegmentCompressor). It can be used to
@@ -65,8 +76,9 @@ func (s LZ4Compressor) Encode(data []byte) ([]byte, error) {
 	maxLength := lz4.CompressBlockBound(len(data))
 	buf := make([]byte, maxLength+dataLengthSize)
 
-	var compressor lz4.Compressor
+	compressor := compressorPool.Get().(*lz4.Compressor)
 	n, err := compressor.CompressBlock(data, buf[dataLengthSize:])
+	compressorPool.Put(compressor)
 	// According to lz4.CompressBlock doc, it doesn't fail as long as the dst
 	// buffer length is at least lz4.CompressBlockBound(len(data))) bytes, but
 	// we check for error anyway just to be thorough. Given that bound, it always
@@ -100,8 +112,9 @@ func (s LZ4Compressor) AppendCompressed(dst, src []byte) ([]byte, error) {
 	oldDstLen := len(dst)
 	dst = grow(dst, maxLength)
 
-	var compressor lz4.Compressor
+	compressor := compressorPool.Get().(*lz4.Compressor)
 	n, err := compressor.CompressBlock(src, dst[oldDstLen:])
+	compressorPool.Put(compressor)
 	if err != nil {
 		return nil, err
 	}
