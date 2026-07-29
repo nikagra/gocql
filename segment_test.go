@@ -24,6 +24,7 @@ package gocql
 import (
 	"bytes"
 	"encoding/binary"
+	"runtime"
 	"testing"
 
 	"github.com/gocql/gocql/internal/crc"
@@ -115,6 +116,74 @@ func TestNewCompressedSegment_IncompressiblePayloadFallsBackToRaw(t *testing.T) 
 	}
 	if !h.isSelfContained {
 		t.Fatalf("isSelfContained = false, want true")
+	}
+}
+
+// TestReadSegmentPayloadReusesScratch pins that reading consecutive segments with
+// one scratch does not allocate. A connection's receive loop is serialized on its
+// serve() goroutine, so the payload buffers are reused; allocating them per
+// segment costs one (uncompressed) or two (compressed) buffers of up to
+// maxSegmentPayloadSize for every segment received.
+func TestReadSegmentPayloadReusesScratch(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5A}, 8192)
+
+	for _, tc := range []struct {
+		name       string
+		compressor Compressor
+	}{
+		{"uncompressed", nil},
+		{"compressed", testMockedCompressor{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				seg []byte
+				err error
+			)
+			if tc.compressor != nil {
+				seg, err = newCompressedSegment(payload, true, tc.compressor)
+			} else {
+				seg, err = newUncompressedSegment(payload, true)
+			}
+			if err != nil {
+				t.Fatalf("build segment: %v", err)
+			}
+
+			var scratch segmentScratch
+			r := bytes.NewReader(seg)
+			read := func() {
+				r.Reset(seg)
+				h, err := readSegmentHeader(r, tc.compressor)
+				if err != nil {
+					t.Fatalf("readSegmentHeader: %v", err)
+				}
+				got, err := readSegmentPayload(r, h, tc.compressor, &scratch)
+				if err != nil {
+					t.Fatalf("readSegmentPayload: %v", err)
+				}
+				if len(got) != len(payload) {
+					t.Fatalf("payload length %d, want %d", len(got), len(payload))
+				}
+			}
+
+			// The first read legitimately allocates the scratch buffers.
+			read()
+
+			// Bytes rather than allocation count: reading a segment header still
+			// heap-allocates two small fixed-size buffers, which is not what this
+			// test is about. Eight reads must not add up to even one payload buffer.
+			const reads = 8
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			for i := 0; i < reads; i++ {
+				read()
+			}
+			runtime.ReadMemStats(&after)
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= uint64(len(payload)) {
+				t.Errorf("reading %d segments allocated %d bytes, want less than one %d-byte payload buffer",
+					reads, allocated, len(payload))
+			}
+		})
 	}
 }
 

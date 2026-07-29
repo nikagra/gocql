@@ -544,6 +544,26 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 	return nil
 }
 
+// adoptFrameBody takes ownership of a frame body that is already fully in memory,
+// instead of reading and copying it as readFrame does. It is used for a v5 frame
+// reassembled from several transport segments (Conn.recvSplitFrame): that buffer
+// is already exactly frame-sized, so copying it would mean holding the frame twice
+// — 512 MiB for a maxFrameSize response.
+//
+// f.readBuffer is deliberately left pointing at the pooled buffer, so releasing
+// the framer drops the adopted body instead of retaining an outsized buffer in the
+// framer pool. Segment-level decompression has already happened, so unlike
+// readFrame there is no frame-header compression flag to honour (it only exists
+// below v5).
+func (f *framer) adoptFrameBody(body []byte, head *frm.FrameHeader) error {
+	if head.Length != len(body) {
+		return fmt.Errorf("gocql: frame body length %d does not match the %d bytes reassembled", head.Length, len(body))
+	}
+	f.buf = body
+	f.header = head
+	return nil
+}
+
 func (f *framer) parseFrame() (frame frame, err error) {
 	defer func() {
 		if r := recover(); r != nil {

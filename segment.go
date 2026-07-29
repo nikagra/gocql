@@ -53,6 +53,52 @@ type segmentHeader struct {
 	isSelfContained bool
 }
 
+// segmentScratch holds the buffers a segment payload is read into. Every inbound
+// segment would otherwise allocate its wire payload, plus a second buffer for the
+// decompressed bytes of a compressed segment — one or two allocations of up to
+// maxSegmentPayloadSize (~128 KiB) each, per segment. A connection's receive path
+// runs entirely on its serve() goroutine, so it can reuse one instance for every
+// segment it reads.
+//
+// The consequence is that a payload returned by readSegmentPayload aliases these
+// buffers and is only valid until the next segment is read with the same scratch.
+// Every caller either copies the payload (reassembly) or fully consumes it (frame
+// parsing copies the body into a pooled framer) before reading the next segment.
+type segmentScratch struct {
+	// wire holds the payload bytes as they arrive on the wire, which for a
+	// compressed segment means the still-compressed bytes.
+	wire []byte
+	// decompressed holds the payload of a compressed segment after decompression.
+	decompressed []byte
+}
+
+// wireBuf returns the wire buffer resized to exactly n bytes, ready to be read
+// into, reallocating only when what it already holds is too small. n comes from a
+// segment header, where both layouts carry the payload length in 17 bits, so it is
+// inherently bounded by maxSegmentPayloadSize.
+func (s *segmentScratch) wireBuf(n int) []byte {
+	if cap(s.wire) < n {
+		s.wire = make([]byte, n)
+	}
+	s.wire = s.wire[:n]
+	return s.wire
+}
+
+// decompress decompresses src into the reusable decompressed buffer.
+func (s *segmentScratch) decompress(segComp SegmentCompressor, src []byte, decompressedLen int) ([]byte, error) {
+	if cap(s.decompressed) < decompressedLen {
+		s.decompressed = make([]byte, 0, decompressedLen)
+	}
+	out, err := segComp.AppendDecompressed(s.decompressed[:0], src, uint32(decompressedLen))
+	if err != nil {
+		return nil, err
+	}
+	// Keep whatever buffer the compressor ended up using, so that a compressor
+	// which had to grow it does not have to grow it again for the next segment.
+	s.decompressed = out
+	return out, nil
+}
+
 // readSegmentHeader reads and validates the fixed-size header of the next
 // segment, consuming only the header bytes. When compressor is non-nil the
 // compressed-segment layout is used, otherwise the uncompressed layout.
@@ -65,12 +111,13 @@ func readSegmentHeader(r io.Reader, compressor Compressor) (segmentHeader, error
 
 // readSegmentPayload reads and verifies the payload and trailing CRC32 that
 // follow a header previously read by readSegmentHeader, returning the
-// reconstructed (decompressed, if applicable) payload bytes.
-func readSegmentPayload(r io.Reader, h segmentHeader, compressor Compressor) ([]byte, error) {
+// reconstructed (decompressed, if applicable) payload bytes. The result aliases
+// scratch; see segmentScratch.
+func readSegmentPayload(r io.Reader, h segmentHeader, compressor Compressor, scratch *segmentScratch) ([]byte, error) {
 	if compressor != nil {
-		return readCompressedSegmentPayload(r, h, compressor)
+		return readCompressedSegmentPayload(r, h, compressor, scratch)
 	}
-	return readUncompressedSegmentPayload(r, h)
+	return readUncompressedSegmentPayload(r, h, scratch)
 }
 
 func readUncompressedSegmentHeader(r io.Reader) (segmentHeader, error) {
@@ -95,8 +142,8 @@ func readUncompressedSegmentHeader(r io.Reader) (segmentHeader, error) {
 	}, nil
 }
 
-func readUncompressedSegmentPayload(r io.Reader, h segmentHeader) ([]byte, error) {
-	payload := make([]byte, h.payloadLen)
+func readUncompressedSegmentPayload(r io.Reader, h segmentHeader, scratch *segmentScratch) ([]byte, error) {
+	payload := scratch.wireBuf(h.payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, fmt.Errorf("gocql: failed to read uncompressed frame payload, err: %w", err)
 	}
@@ -162,8 +209,8 @@ func asSegmentCompressor(compressor Compressor) (SegmentCompressor, error) {
 	return segComp, nil
 }
 
-func readCompressedSegmentPayload(r io.Reader, h segmentHeader, compressor Compressor) ([]byte, error) {
-	compressedPayload := make([]byte, h.payloadLen)
+func readCompressedSegmentPayload(r io.Reader, h segmentHeader, compressor Compressor, scratch *segmentScratch) ([]byte, error) {
+	compressedPayload := scratch.wireBuf(h.payloadLen)
 	if _, err := io.ReadFull(r, compressedPayload); err != nil {
 		return nil, fmt.Errorf("gocql: failed to read compressed frame payload, err: %w", err)
 	}
@@ -189,7 +236,7 @@ func readCompressedSegmentPayload(r io.Reader, h segmentHeader, compressor Compr
 	if err != nil {
 		return nil, err
 	}
-	uncompressedPayload, err := segComp.AppendDecompressed(nil, compressedPayload, uint32(h.uncompressedLen))
+	uncompressedPayload, err := scratch.decompress(segComp, compressedPayload, h.uncompressedLen)
 	if err != nil {
 		return nil, err
 	}
@@ -198,34 +245,6 @@ func readCompressedSegmentPayload(r io.Reader, h segmentHeader, compressor Compr
 	}
 
 	return uncompressedPayload, nil
-}
-
-// readUncompressedSegment reads a full uncompressed segment (header + payload)
-// in one call. It is a convenience wrapper over the two-phase readers.
-func readUncompressedSegment(r io.Reader) ([]byte, bool, error) {
-	h, err := readUncompressedSegmentHeader(r)
-	if err != nil {
-		return nil, false, err
-	}
-	payload, err := readUncompressedSegmentPayload(r, h)
-	if err != nil {
-		return nil, false, err
-	}
-	return payload, h.isSelfContained, nil
-}
-
-// readCompressedSegment reads a full compressed segment (header + payload) in
-// one call. It is a convenience wrapper over the two-phase readers.
-func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, error) {
-	h, err := readCompressedSegmentHeader(r)
-	if err != nil {
-		return nil, false, err
-	}
-	payload, err := readCompressedSegmentPayload(r, h, compressor)
-	if err != nil {
-		return nil, false, err
-	}
-	return payload, h.isSelfContained, nil
 }
 
 // appendUncompressedSegment encodes payload as one uncompressed transport segment
@@ -329,6 +348,40 @@ func appendCompressedSegment(dst, payload []byte, isSelfContained bool, compress
 	header[headerSize+2] = byte(headerChecksum >> 16)
 
 	return binary.LittleEndian.AppendUint32(dst, crc.Crc32(dst[payloadStart:])), nil
+}
+
+// readUncompressedSegment reads a full uncompressed segment (header + payload)
+// in one call, into a payload buffer of its own. It is a convenience wrapper over
+// the two-phase readers.
+func readUncompressedSegment(r io.Reader) ([]byte, bool, error) {
+	var scratch segmentScratch
+
+	h, err := readUncompressedSegmentHeader(r)
+	if err != nil {
+		return nil, false, err
+	}
+	payload, err := readUncompressedSegmentPayload(r, h, &scratch)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, h.isSelfContained, nil
+}
+
+// readCompressedSegment reads a full compressed segment (header + payload) in
+// one call, into payload buffers of its own. It is a convenience wrapper over the
+// two-phase readers.
+func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, error) {
+	var scratch segmentScratch
+
+	h, err := readCompressedSegmentHeader(r)
+	if err != nil {
+		return nil, false, err
+	}
+	payload, err := readCompressedSegmentPayload(r, h, compressor, &scratch)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, h.isSelfContained, nil
 }
 
 // newUncompressedSegment returns payload as a standalone uncompressed segment.

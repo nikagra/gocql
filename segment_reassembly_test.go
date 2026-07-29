@@ -24,11 +24,16 @@ package gocql
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	frm "github.com/gocql/gocql/internal/frame"
+	"github.com/gocql/gocql/internal/streams"
 )
 
 // segmentReader is a minimal ConnReader backed by an in-memory byte stream,
@@ -58,51 +63,111 @@ func mustUncompressedSegment(t *testing.T, payload []byte, selfContained bool) [
 	return seg
 }
 
-func TestReadContinuationSegmentIntoAppends(t *testing.T) {
+func TestReadContinuationSegmentReturnsPayload(t *testing.T) {
 	seg := mustUncompressedSegment(t, []byte("hello"), false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	var buf bytes.Buffer
-	if err := c.readContinuationSegmentInto(&buf, maxFrameSize); err != nil {
+	payload, err := c.readContinuationSegment()
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := buf.String(); got != "hello" {
+	if got := string(payload); got != "hello" {
 		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 
-func TestReadContinuationSegmentIntoRejectsSelfContained(t *testing.T) {
+func TestReadContinuationSegmentRejectsSelfContained(t *testing.T) {
 	seg := mustUncompressedSegment(t, []byte("hello"), true)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	var buf bytes.Buffer
-	err := c.readContinuationSegmentInto(&buf, maxFrameSize)
+	_, err := c.readContinuationSegment()
 	if err == nil || !strings.Contains(err.Error(), "expected a continuation") {
 		t.Fatalf("expected self-contained rejection, got %v", err)
 	}
 }
 
-func TestReadContinuationSegmentIntoRejectsEmptyPayload(t *testing.T) {
+func TestReadContinuationSegmentRejectsEmptyPayload(t *testing.T) {
 	seg := mustUncompressedSegment(t, nil, false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	var buf bytes.Buffer
-	err := c.readContinuationSegmentInto(&buf, maxFrameSize)
+	_, err := c.readContinuationSegment()
 	if err == nil || !strings.Contains(err.Error(), "no progress") {
 		t.Fatalf("expected no-progress rejection, got %v", err)
 	}
 }
 
-func TestReadContinuationSegmentIntoRejectsOverLimit(t *testing.T) {
-	seg := mustUncompressedSegment(t, []byte("0123456789"), false)
+// TestRecvSplitFrameRejectsOverlongStream pins that continuation segments
+// carrying more bytes than the CQL frame header declared are rejected, rather
+// than appended past the size the reassembly buffer was allocated for.
+func TestRecvSplitFrameRejectsOverlongStream(t *testing.T) {
+	// A header declaring a 4-byte body, so the whole frame is headSize+4 bytes,
+	// followed by a continuation segment carrying 8 body bytes.
+	header := make([]byte, headSize)
+	header[0] = protoVersion5 | protoDirectionMask
+	header[8] = 4
+
+	seg := mustUncompressedSegment(t, []byte("01234567"), false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	var buf bytes.Buffer
-	buf.WriteString("prefix") // 6 bytes already buffered
-	// limit 10 leaves room for only 4 more bytes; the 10-byte payload exceeds it.
-	err := c.readContinuationSegmentInto(&buf, 10)
-	if err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
-		t.Fatalf("expected over-limit rejection, got %v", err)
+	err := c.recvSplitFrame(context.Background(), header)
+	if err == nil || !strings.Contains(err.Error(), "exceeds its declared length") {
+		t.Fatalf("expected over-long rejection, got %v", err)
+	}
+}
+
+// TestRecvSplitFrameAllocatesExactlyOneFrameBuffer pins the reassembly buffer
+// against the two allocation regressions it is shaped to avoid: growing it as
+// payloads arrive (a bytes.Buffer reaches ~2x the frame size), and then copying
+// the assembled frame into the read framer instead of handing it over. Both are
+// invisible in the output but double or triple the memory a single large response
+// occupies.
+func TestRecvSplitFrameAllocatesExactlyOneFrameBuffer(t *testing.T) {
+	const bodyLen = 3 * maxSegmentPayloadSize
+
+	// Enough streams to also let the framer pool warm up.
+	const runs = 4
+	body := bytes.Repeat([]byte{0x5A}, bodyLen)
+	frame := make([]byte, headSize)
+	frame[0] = protoVersion5 | protoDirectionMask
+	// Stream -1 is the event stream: with no session attached, processFrame parses
+	// the frame and drops it, which is all this test needs. A READY frame carries
+	// no body fields, so the filler body is never inspected.
+	binary.BigEndian.PutUint16(frame[2:4], uint16(0xFFFF))
+	frame[4] = byte(frm.OpReady)
+	binary.BigEndian.PutUint32(frame[5:headSize], uint32(bodyLen))
+	frame = append(frame, body...)
+
+	var stream []byte
+	for src := frame; len(src) > 0; {
+		n := min(len(src), maxSegmentPayloadSize)
+		stream = append(stream, mustUncompressedSegment(t, src[:n], false)...)
+		src = src[n:]
+	}
+
+	c := &Conn{
+		r:       newSegmentReader(bytes.Repeat(stream, runs)),
+		streams: streams.New(),
+		logger:  &defaultLogger{},
+	}
+	c.initFramerCache()
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		// Stream 0 is unused, so processFrame parses and drops the frame; that is
+		// enough to exercise reassembly and the framer hand-over.
+		if err := c.recvSegment(context.Background()); err != nil {
+			t.Fatalf("run %d: recvSegment: %v", i, err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+
+	// One buffer per frame, sized to the frame: anything much above that means
+	// either the buffer was grown into or the frame was copied again.
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if limit := uint64(runs) * uint64(len(frame)) * 3 / 2; allocated > limit {
+		t.Errorf("reassembling %d frames of %d bytes allocated %d bytes, want at most %d",
+			runs, len(frame), allocated, limit)
 	}
 }
 
