@@ -200,10 +200,14 @@ type Conn struct {
 	// segScratch holds the reusable buffers inbound v5 segments are read into.
 	// Only touched by the receive path, which runs on the serve() goroutine.
 	segScratch segmentScratch
-	r          ConnReader
-	session    *Session
-	framers    connFramers
-	cancel     context.CancelFunc
+	// segHeaderReader counts the bytes consumed by the current segment-header read
+	// (see readFirstSegmentHeader). Reused rather than allocated per header, and
+	// like segScratch only touched on the serve() goroutine.
+	segHeaderReader countingReader
+	r               connReadSource
+	session         *Session
+	framers         connFramers
+	cancel          context.CancelFunc
 	// currentKeyspace is the keyspace this connection was switched to by
 	// Conn.UseKeyspace, and the default the prepared-statement cache is keyed by
 	// (see executeQuery/executeBatch). It deliberately tracks only driver-issued
@@ -593,16 +597,41 @@ func (s *startupCoordinator) options(ctx context.Context, startupCompleted *atom
 	return nil
 }
 
-func (s *startupCoordinator) startup(ctx context.Context, startupCompleted *atomic.Bool) error {
-	m := map[string]string{
-		"CQL_VERSION":    s.conn.cfg.CQLVersion,
-		"DRIVER_NAME":    s.conn.session.cfg.DriverName,
-		"DRIVER_VERSION": s.conn.session.cfg.DriverVersion,
+// startupOptions builds the STARTUP options the driver always sends.
+//
+// The application's options go in first so the driver-owned keys below can
+// overwrite them, never the other way round. They describe the driver and the
+// protocol it is speaking, and are not the application's to change: a callback
+// that set CQL_VERSION could make every connection in the cluster fail the
+// handshake, and one that set DRIVER_NAME or DRIVER_VERSION would misreport the
+// driver to the server for the life of the connection.
+//
+// The ordering is easy to lose, which is how it was lost: upstream has no
+// ApplicationInfo hook and writes these three as a map literal, so merging the
+// two put the callback last.
+func startupOptions(cqlVersion, driverName, driverVersion string, info ApplicationInfo) map[string]string {
+	m := map[string]string{}
+
+	if info != nil {
+		info.UpdateStartupOptions(m)
 	}
 
-	if s.conn.session.cfg.ApplicationInfo != nil {
-		s.conn.session.cfg.ApplicationInfo.UpdateStartupOptions(m)
-	}
+	m["CQL_VERSION"] = cqlVersion
+	m["DRIVER_NAME"] = driverName
+	m["DRIVER_VERSION"] = driverVersion
+
+	return m
+}
+
+func (s *startupCoordinator) startup(ctx context.Context, startupCompleted *atomic.Bool) error {
+	// COMPRESSION and the CQL protocol extensions below are driver-owned too, and
+	// are already protected by being written after the callback has run.
+	m := startupOptions(
+		s.conn.cfg.CQLVersion,
+		s.conn.session.cfg.DriverName,
+		s.conn.session.cfg.DriverVersion,
+		s.conn.session.cfg.ApplicationInfo,
+	)
 
 	if s.conn.compressor != nil {
 		comp := s.conn.supported["COMPRESSION"]
@@ -781,6 +810,17 @@ func (c *Conn) serve(ctx context.Context) {
 		if err == nil {
 			continue
 		}
+		// A benign idle timeout: the peer simply had nothing to send. Log it and
+		// read again rather than dropping a healthy connection.
+		//
+		// Expected to be unreachable in practice — every header read runs with the
+		// read deadline disarmed (readFrameHeader, readFirstSegmentHeader), so it
+		// cannot time out at all. The branch is kept as the safety net for a regression
+		// in that disarm: without it, such a regression would close every idle
+		// connection once per ReadTimeout instead of printing this line. It is
+		// deliberately narrow — a timeout that already consumed part of a header is
+		// not normalised to ErrReadHeaderTimeout, because the stream position would be
+		// unknown and continuing would mis-frame everything after it.
 		if errors.Is(err, ErrReadHeaderTimeout) {
 			c.logger.Print("gocql: read header timeout") // TODO: Provide more details from wrapped error?
 			err = nil
@@ -922,19 +962,21 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 // readFrameHeader reads one CQL frame header from r with the read deadline
 // disarmed: the serve() loop waits indefinitely for the next inbound frame, so a
 // short ReadTimeout must not fire here. The deadline is re-armed before returning,
-// so the body read that follows is still bounded by the operational timeout.
+// so the body read that follows is still bounded by the operational timeout — and
+// re-armed via defer, so a panic cannot leave the connection deadline-free.
 //
 // Disarming through a dedicated flag (rather than zeroing and restoring the
 // connReader timeout) keeps the operational timeout intact, so a concurrent
 // finalizeConnection switching the reader from ConnectTimeout to ReadTimeout is
 // never lost. The header read itself clears any stale deadline (connReader.Read).
 //
-// On proto v5 r is a reader over an already-received segment payload, which has no
-// deadline to disarm; missing it in that case is correct, not a bug.
+// Unlike readFirstSegmentHeader, the disarm here is a dynamic check: on proto v5 r
+// is a reader over an already-received segment payload, which has no deadline to
+// disarm. Missing it in that case is correct, not a bug.
 func (c *Conn) readFrameHeader(r io.Reader) (frm.FrameHeader, error) {
-	if cr, ok := r.(*connReader); ok {
-		cr.setDisarm(true)
-		defer cr.setDisarm(false)
+	if d, ok := r.(deadlineDisarmer); ok {
+		d.setDisarm(true)
+		defer d.setDisarm(false)
 	}
 	return readHeader(r, c.headerBuf[:])
 }
@@ -1119,9 +1161,12 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 	// Note the deadline is per-read (see connReader.Read), not per-frame: a
 	// single logical CQL frame may span many segments (recvSplitFrame), so
 	// ReadTimeout bounds how long any one read may stall, not the total time
-	// to assemble a frame. A peer that keeps trickling progress just under
-	// ReadTimeout is instead bounded by the frame length recvSplitFrame enforces
-	// against the reassembled size.
+	// to assemble a frame. And a read that stalls but keeps making progress is
+	// resumed up to maxReadAttempts times, so one read can take that multiple of
+	// ReadTimeout before failing — only a read that delivers nothing fails within a
+	// single one. A peer that keeps trickling progress is therefore not bounded by
+	// time at all; it is bounded by the frame length recvSplitFrame enforces against
+	// the reassembled size.
 	//
 	// netStart/netEnd bracket this read for FrameHeaderObserver. The CQL headers
 	// inside are parsed out of memory further down, so timing them there would
@@ -1162,6 +1207,24 @@ func (c *Conn) observedNow() time.Time {
 	return time.Now()
 }
 
+// countingReader counts the bytes a wrapped reader delivered, so a caller can tell
+// a read that consumed nothing from one that consumed part of what it wanted.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) reset(r io.Reader) {
+	c.r = r
+	c.n = 0
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
 // readFirstSegmentHeader reads the header of the next segment while the read
 // deadline is disarmed, so an idle serve() loop can block indefinitely waiting
 // for the next frame to begin. The deadline is disarmed via a dedicated flag
@@ -1176,15 +1239,20 @@ func (c *Conn) observedNow() time.Time {
 // the stream at an unknown offset, so it stays a plain error and takes the
 // connection down rather than mis-framing everything that follows.
 func (c *Conn) readFirstSegmentHeader() (segmentHeader, error) {
-	if cr, ok := c.r.(*connReader); ok {
-		cr.setDisarm(true)
-		defer cr.setDisarm(false)
-	}
+	// No type assertion: Conn.r is a connReadSource, so the disarm always applies.
+	// Deferred so a panic in the header read cannot leave the connection with its
+	// deadline permanently disarmed.
+	c.r.setDisarm(true)
+	defer c.r.setDisarm(false)
 
-	hdr, err := readSegmentHeader(c.r, c.compressor)
+	// Counted rather than plumbing a byte count out of the segment header readers:
+	// the count only matters here, where the benign/fatal decision is made.
+	c.segHeaderReader.reset(c.r)
+
+	hdr, err := readSegmentHeader(&c.segHeaderReader, c.compressor)
 	if err != nil {
 		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
+		if c.segHeaderReader.n == 0 && errors.As(err, &netErr) && netErr.Timeout() {
 			return segmentHeader{}, fmt.Errorf("%w: %w", ErrReadHeaderTimeout, err)
 		}
 		return segmentHeader{}, err
@@ -1196,7 +1264,9 @@ func (c *Conn) readFirstSegmentHeader() (segmentHeader, error) {
 // multiple non-self-contained segments and processes it. first is the payload of
 // the segment already consumed by recvSegment.
 //
-// Each read here is bounded by ReadTimeout (the peer is mid-transfer). The
+// Every read here runs with the deadline armed (the peer is mid-transfer), so a
+// peer that stops sending fails within one ReadTimeout — see connReader.Read for
+// how a read that stalls but keeps progressing is resumed instead. The
 // reassembly buffer is allocated exactly once, sized to the frame length the peer
 // declared in the CQL frame header, and appending the arriving payloads is bounded
 // by that length. So neither a lying header nor incremental growth can inflate it:
@@ -1269,7 +1339,8 @@ func (c *Conn) recvSplitFrame(ctx context.Context, first []byte, netStart, netEn
 
 // readContinuationSegment reads the next segment of a frame split across several
 // segments and returns its payload, which aliases c.segScratch and is therefore
-// only valid until the next segment is read. Each read is bounded by ReadTimeout.
+// only valid until the next segment is read. The reads run with the deadline armed,
+// so a peer that stops sending fails within one ReadTimeout (connReader.Read).
 // A self-contained segment, or one that makes no forward progress (empty
 // payload), is rejected so a hostile peer cannot drive an infinite reassembly
 // loop.
@@ -1339,7 +1410,25 @@ type ConnReader interface {
 	GetTimeout() time.Duration
 }
 
-// connReader implements ConnReader.
+// deadlineDisarmer is a reader whose read deadline can be disarmed for a read
+// that is expected to wait indefinitely (the idle wait for the next frame or
+// segment header). See connReader.armDeadline.
+type deadlineDisarmer interface {
+	setDisarm(bool)
+}
+
+// connReadSource is the reader Conn reads through. It is deliberately narrower
+// than the exported ConnReader: the disarm is not optional for the connection's
+// own reader, so requiring it here turns "this reader silently loses the disarm"
+// from a runtime surprise into a compile error. The unexported method means only
+// this package can implement it, which is fine — Conn.r is unexported and no
+// exported API accepts or returns a connReadSource.
+type connReadSource interface {
+	ConnReader
+	deadlineDisarmer
+}
+
+// connReader implements connReadSource (and therefore ConnReader).
 type connReader struct {
 	conn    net.Conn
 	r       *bufio.Reader
@@ -1347,16 +1436,65 @@ type connReader struct {
 	disarm  atomic.Bool
 }
 
+var _ connReadSource = (*connReader)(nil)
+
+// maxReadAttempts bounds how many times Read re-arms the deadline and resumes a
+// read that timed out while still making progress. See Read.
+const maxReadAttempts = 5
+
+// Read fills p, resuming across read-deadline expiries for as long as the peer
+// keeps delivering bytes.
+//
+// The retry exists because ReadTimeout is a per-read budget, not a transfer budget:
+// a large frame body arriving over a slow link can need more than one budget while
+// being perfectly healthy. Each attempt arms a fresh deadline and resumes at p[n:],
+// so no bytes are dropped.
+//
+// It is gated on forward progress, which is what keeps ReadTimeout meaningful as
+// "identify faulty connections early and drop it" (see ClusterConfig.ReadTimeout):
+// an attempt that delivered nothing means the peer has stopped, and that fails
+// immediately in a single ReadTimeout rather than after maxReadAttempts of them.
+// Only a timeout is resumable — for any other network error the stream's position
+// is no longer trustworthy, so resuming could silently mis-frame.
+//
+// Note the caller can still observe a partial read: on failure n bytes of p were
+// consumed off the connection and cannot be put back, so a frame reader that gets
+// an error here has to treat the connection as desynced (see processFrameSource).
 func (c *connReader) Read(p []byte) (n int, err error) {
-	if err = c.armDeadline(); err != nil {
-		return 0, err
+	for attempt := 0; attempt < maxReadAttempts; attempt++ {
+		if aerr := c.armDeadline(); aerr != nil {
+			return n, aerr
+		}
+
+		nn, rerr := io.ReadFull(c.r, p[n:])
+		n += nn
+		if rerr == nil {
+			return n, nil
+		}
+		err = rerr
+
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			// Not resumable. Timeout() rather than the deprecated Temporary(), which
+			// is also true for e.g. ECONNRESET — where the connection is gone and
+			// retrying just burns attempts.
+			break
+		}
+		if nn == 0 {
+			// The peer stopped sending, not merely slowed down.
+			break
+		}
 	}
-	n, err = io.ReadFull(c.r, p)
-	return
+
+	return n, err
 }
 
-// armDeadline arms (or clears) the underlying read deadline for the read that is
-// about to start. The setter error is returned rather than dropped: a net.Conn
+// armDeadline arms (or clears) the underlying read deadline for the read attempt
+// that is about to start — once per attempt, so a Read that resumes after a timeout
+// gets a fresh deadline, and so a concurrent finalizeConnection switching the
+// reader from ConnectTimeout to ReadTimeout is picked up by the next attempt.
+//
+// The setter error is returned rather than dropped: a net.Conn
 // whose SetReadDeadline fails would otherwise be read with no deadline at all,
 // or with a stale one from an earlier read. This mirrors the write path, where
 // deadlineContextWriter.writeContext and writeCoalescer.flush both report
@@ -1390,10 +1528,6 @@ func (c *connReader) armDeadline() error {
 // finalizeConnection.
 func (c *connReader) setDisarm(v bool) {
 	c.disarm.Store(v)
-}
-
-func (c *connReader) Write(b []byte) (n int, err error) {
-	return c.conn.Write(b)
 }
 
 func (c *connReader) Close() error {

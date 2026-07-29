@@ -131,6 +131,10 @@ func (c *Conn) getWriteFramer() *framer {
 func (cf *connFramers) getWrite(c *Conn) *framer {
 	f := cf.writePool.get(c)
 	f.released.Store(false)
+	// Before initCache runs, cf.defaults is still zero, so handshake framers get
+	// no flags at all. That is what the handshake needs: the compressor is not yet
+	// negotiated (so FlagCompress must not be set on OPTIONS/STARTUP), and no
+	// version-derived flag exists to seed — see defaultFramerFlags.
 	f.flags = cf.defaults.flags
 	return f
 }

@@ -41,6 +41,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/gocql/gocql/tablets"
 )
 
@@ -4239,6 +4241,92 @@ func TestQueryRoutingInfoAccessorsConcurrentWithWrite(t *testing.T) {
 		}()
 
 		wg.Wait()
+	})
+}
+
+// TestSetKeyspaceInvalidatesRoutingInfo pins that changing the keyspace override
+// drops the routing metadata GetRoutingKey resolved for the previous one.
+//
+// Keyspace() prefers routingInfo.keyspace over q.keyspace, and the partitioner
+// and table are only ever refreshed by GetRoutingKey. A host-pinned or explicitly
+// routed query never calls GetRoutingKey again, so a stale cache would route
+// (and be reported to observers) with the previous keyspace's metadata.
+func TestSetKeyspaceInvalidatesRoutingInfo(t *testing.T) {
+	t.Parallel()
+
+	// Stand in for GetRoutingKey having resolved the first override.
+	cached := func(ri *queryRoutingInfo) {
+		ri.mu.Lock()
+		defer ri.mu.Unlock()
+		ri.keyspace = "ks_a"
+		ri.table = "tbl_a"
+		ri.partitioner = murmur3Partitioner{}
+		ri.lwt = true
+	}
+
+	t.Run("Query", func(t *testing.T) {
+		q := &Query{routingInfo: &queryRoutingInfo{}}
+		q.SetKeyspace("ks_a")
+		cached(q.routingInfo)
+
+		q.SetKeyspace("ks_b")
+
+		require.Equal(t, "ks_b", q.Keyspace(), "Keyspace() must follow the new override, not the stale cache")
+		require.Empty(t, q.Table(), "cached table must not survive a keyspace change")
+		require.Nil(t, q.routingInfo.getPartitioner(), "cached partitioner must not survive a keyspace change")
+		require.False(t, q.routingInfo.isLWT(), "cached lwt flag must not survive a keyspace change")
+	})
+
+	t.Run("Batch", func(t *testing.T) {
+		b := &Batch{routingInfo: &queryRoutingInfo{}}
+		b.SetKeyspace("ks_a")
+		cached(b.routingInfo)
+
+		b.SetKeyspace("ks_b")
+
+		require.Equal(t, "ks_b", b.Keyspace())
+		require.Empty(t, b.Table())
+		require.Nil(t, b.routingInfo.getPartitioner(), "cached partitioner must not survive a keyspace change")
+		require.False(t, b.routingInfo.isLWT(), "cached lwt flag must not survive a keyspace change")
+	})
+
+	// WithContext returns a shallow copy that shares the routingInfo pointer, so
+	// dropping the cache in place would reach back into the query the copy came
+	// from. That query is not necessarily going to rebuild it: GetRoutingKey
+	// returns early when an explicit routing key is set, which leaves it routing
+	// on a nil partitioner and reporting an empty table — a worse failure than the
+	// stale cache, and one the source never asked for.
+	t.Run("Query/WithContext does not disturb the source", func(t *testing.T) {
+		q := &Query{routingInfo: &queryRoutingInfo{}, routingKey: []byte{0x01}}
+		q.SetKeyspace("ks_a")
+		cached(q.routingInfo)
+
+		copied := q.WithContext(context.Background())
+		copied.SetKeyspace("ks_b")
+
+		require.Equal(t, "ks_b", copied.Keyspace(), "the copy must follow its own override")
+		require.Empty(t, copied.Table(), "the copy must not inherit the source's cached table")
+
+		require.Equal(t, "ks_a", q.Keyspace(), "the source's resolved keyspace must survive")
+		require.Equal(t, "tbl_a", q.Table(), "the source's cached table must survive")
+		require.NotNil(t, q.routingInfo.getPartitioner(), "the source's cached partitioner must survive")
+		require.True(t, q.routingInfo.isLWT(), "the source's cached lwt flag must survive")
+	})
+
+	t.Run("Batch/WithContext does not disturb the source", func(t *testing.T) {
+		b := &Batch{routingInfo: &queryRoutingInfo{}}
+		b.SetKeyspace("ks_a")
+		cached(b.routingInfo)
+
+		copied := b.WithContext(context.Background())
+		copied.SetKeyspace("ks_b")
+
+		require.Equal(t, "ks_b", copied.Keyspace())
+		require.Nil(t, copied.routingInfo.getPartitioner(), "the copy must not inherit the source's cached partitioner")
+
+		require.Equal(t, "tbl_a", b.Table(), "the source's cached table must survive")
+		require.NotNil(t, b.routingInfo.getPartitioner(), "the source's cached partitioner must survive")
+		require.True(t, b.routingInfo.isLWT(), "the source's cached lwt flag must survive")
 	})
 }
 

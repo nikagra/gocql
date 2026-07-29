@@ -2595,6 +2595,21 @@ func (q *Query) GetHostID() string {
 // Only available on protocol >= 5.
 func (q *Query) SetKeyspace(keyspace string) *Query {
 	q.keyspace = keyspace
+	// GetRoutingKey resolves the keyspace override into routingInfo, and
+	// Keyspace() gives that cached value precedence over q.keyspace. Left alone,
+	// SetKeyspace("a"); GetRoutingKey(); SetKeyspace("b") would keep reporting
+	// keyspace "a" — and keep routing with "a"'s table metadata and partitioner —
+	// on any execution path that does not call GetRoutingKey again (a host-pinned
+	// or explicitly routed query).
+	//
+	// Detached rather than cleared in place, because WithContext returns a shallow
+	// copy that shares this pointer. Clearing would reach back through it and wipe
+	// the cache of the query the copy came from, which is worse than the bug it
+	// fixes: that query's GetRoutingKey returns early when it has an explicit
+	// routing key, so nothing ever rebuilds what was cleared and it goes on with a
+	// nil partitioner and an empty table. A fresh instance gives this query its own
+	// cache and leaves every other holder's intact.
+	q.routingInfo = &queryRoutingInfo{}
 	return q
 }
 
@@ -3690,6 +3705,11 @@ func (b *Batch) GetHostID() string {
 // Only available on protocol >= 5.
 func (b *Batch) SetKeyspace(keyspace string) *Batch {
 	b.keyspace = keyspace
+	// Batch.Keyspace() reads b.keyspace directly, but Batch.GetRoutingKey still
+	// caches the partitioner (and lwt) it resolved for the previous override, and
+	// Batch.Partitioner()/IsLWT() serve that cache. Detached for the same reasons
+	// as Query.SetKeyspace, including the sharing through Batch.WithContext.
+	b.routingInfo = &queryRoutingInfo{}
 	return b
 }
 

@@ -414,31 +414,99 @@ func Test_framer_writeBatchFrame_unnamedValues(t *testing.T) {
 // not part of the wire format. The frame writers must reject them with an
 // explicit error (rather than silently dropping them, panicking, or leaving a
 // partial frame in the reusable framer buffer).
-func Test_framer_writeQueryParams_rejectsUnsupportedOptionsOnV4(t *testing.T) {
+//
+// Driven through buildFrame, the entry point Conn.exec actually uses, for both
+// writers that carry queryParams. Calling writeQueryParams directly would assert
+// nothing: it is the first thing a fresh framer does, so `len(buf) == 0` holds
+// whatever the writer does. Via buildFrame the assertion has teeth — writeQueryFrame
+// writes the header, custom payload and statement before writeQueryParams runs, and
+// writeExecuteFrame additionally writes the prepared id and (on v5) the result
+// metadata id.
+//
+// wantErr pins which validation rejected the frame, so a case cannot pass by
+// tripping an unrelated one.
+func Test_framer_queryParamsWriters_rejectUnsupportedOptionsOnV4(t *testing.T) {
 	nowInSeconds := 123
 	overflow := math.MaxInt32 + 1
 
 	cases := []struct {
-		name  string
-		proto byte
-		opts  queryParams
+		name    string
+		proto   byte
+		opts    queryParams
+		wantErr string
 	}{
-		{"keyspace on v4", protoVersion4, queryParams{consistency: Quorum, keyspace: "ks"}},
-		{"nowInSeconds on v4", protoVersion4, queryParams{consistency: Quorum, nowInSeconds: &nowInSeconds}},
-		{"nowInSeconds overflow on v5", protoVersion5, queryParams{consistency: Quorum, nowInSeconds: &overflow}},
+		{
+			name:    "keyspace on v4",
+			proto:   protoVersion4,
+			opts:    queryParams{consistency: Quorum, keyspace: "ks"},
+			wantErr: "keyspace override can only be set with protocol v5 or higher",
+		},
+		{
+			name:    "nowInSeconds on v4",
+			proto:   protoVersion4,
+			opts:    queryParams{consistency: Quorum, nowInSeconds: &nowInSeconds},
+			wantErr: "now_in_seconds can only be set with protocol v5 or higher",
+		},
+		{
+			name:    "nowInSeconds overflow on v5",
+			proto:   protoVersion5,
+			opts:    queryParams{consistency: Quorum, nowInSeconds: &overflow},
+			wantErr: "overflows int32",
+		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			framer := newFramer(nil, tc.proto)
-			if err := framer.writeQueryParams(&tc.opts); err == nil {
-				t.Fatal("expected an error, got nil")
-			}
-			if len(framer.buf) != 0 {
-				t.Fatalf("expected framer buffer to be untouched on error, got %d bytes", len(framer.buf))
+	writers := []struct {
+		name  string
+		build func(opts queryParams) frameBuilder
+	}{
+		{
+			name: "QUERY",
+			build: func(opts queryParams) frameBuilder {
+				return &writeQueryFrame{statement: "SELECT * FROM system.local", params: opts}
+			},
+		},
+		{
+			name: "EXECUTE",
+			build: func(opts queryParams) frameBuilder {
+				return &writeExecuteFrame{
+					preparedID:       []byte{0x01, 0x02},
+					resultMetadataID: []byte{0x03, 0x04},
+					params:           opts,
+				}
+			},
+		},
+	}
+
+	for _, w := range writers {
+		t.Run(w.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					framer := newFramer(nil, tc.proto)
+
+					err := w.build(tc.opts).buildFrame(framer, 1)
+					require.Error(t, err)
+					require.Contains(t, err.Error(), tc.wantErr)
+					require.Empty(t, framer.buf, "a rejected option must not leave a partial frame in the framer buffer")
+				})
 			}
 		})
 	}
+}
+
+// Test_framer_validateV5Options_acceptsSupportedOptions is the positive half: the
+// shared validator must not reject what v5 does support, or the writers above
+// would fail every legitimate v5 request.
+func Test_framer_validateV5Options_acceptsSupportedOptions(t *testing.T) {
+	nowInSeconds := 123
+	minInt32, maxInt32 := math.MinInt32, math.MaxInt32
+
+	v5 := newFramer(nil, protoVersion5)
+	require.NoError(t, v5.validateV5Options("ks", &nowInSeconds))
+	require.NoError(t, v5.validateV5Options("", &minInt32))
+	require.NoError(t, v5.validateV5Options("", &maxInt32))
+
+	// And neither option set is required: v4 requests must still pass.
+	require.NoError(t, newFramer(nil, protoVersion4).validateV5Options("", nil))
 }
 
 func Test_framer_writeBatchFrame_rejectsUnsupportedOptionsOnV4(t *testing.T) {
@@ -554,13 +622,12 @@ func Test_defaultFramerFlags(t *testing.T) {
 	}{
 		{"v4 no compressor", nil, protoVersion4, 0},
 		{"v4 with compressor", comp, protoVersion4, frm.FlagCompress},
-		{"v5 no compressor", nil, protoVersion5, frm.FlagBetaProtocol},
+		{"v5 no compressor", nil, protoVersion5, 0},
 		// v5 compresses at the segment layer, so no frame-header FlagCompress.
-		{"v5 with compressor", comp, protoVersion5, frm.FlagBetaProtocol},
-		// The version byte may carry the direction/reserved high bit (newFramer
-		// passes it unmasked). Masking must still resolve the beta flag and must not
-		// let the v5 check fall through and re-enable FlagCompress.
-		{"v5|dir with compressor", comp, protoVersion5 | protoDirectionMask, frm.FlagBetaProtocol},
+		{"v5 with compressor", comp, protoVersion5, 0},
+		// A direction/reserved high bit on the version must not defeat the v5
+		// check and re-enable FlagCompress at v5, nor suppress it at v4.
+		{"v5|dir with compressor", comp, protoVersion5 | protoDirectionMask, 0},
 		{"v4|dir with compressor", comp, protoVersion4 | protoDirectionMask, frm.FlagCompress},
 	}
 
@@ -573,20 +640,40 @@ func Test_defaultFramerFlags(t *testing.T) {
 	}
 }
 
-// newFramer must carry FlagBetaProtocol on proto v5 (so startup/fallback framers
-// match the pooled framers from initCache) and must not carry it on v4.
-func Test_newFramer_betaProtocolFlag(t *testing.T) {
-	v5 := newFramer(nil, protoVersion5)
-	if v5.flags&frm.FlagBetaProtocol == 0 {
-		t.Error("newFramer(v5) should set FlagBetaProtocol")
-	}
-	if v5.flags&frm.FlagCompress != 0 {
-		t.Error("newFramer(v5) should not set FlagCompress (v5 compresses at the segment layer)")
+// No framer may ever set FlagBetaProtocol: opting into a server's in-development
+// v5 dialect makes a Cassandra 3.11 handshake succeed and every following frame
+// fail, instead of v5 being rejected cleanly (see protoVersion5, CASSGO-88).
+// Covered here for every way a request framer is built.
+func Test_framerFlags_neverBetaProtocol(t *testing.T) {
+	comp := testMockedCompressor{}
+
+	for _, version := range []byte{protoVersion4, protoVersion5, protoVersion5 | protoDirectionMask} {
+		for _, compressor := range []Compressor{nil, comp} {
+			if got := defaultFramerFlags(compressor, version); got&frm.FlagBetaProtocol != 0 {
+				t.Errorf("defaultFramerFlags(%v, 0x%02x) set FlagBetaProtocol", compressor != nil, version)
+			}
+			if got := newFramer(compressor, version).flags; got&frm.FlagBetaProtocol != 0 {
+				t.Errorf("newFramer(%v, 0x%02x) set FlagBetaProtocol", compressor != nil, version)
+			}
+		}
 	}
 
-	v4 := newFramer(nil, protoVersion4)
-	if v4.flags&frm.FlagBetaProtocol != 0 {
-		t.Error("newFramer(v4) should not set FlagBetaProtocol")
+	// initCache is what the connection actually uses once the handshake completed.
+	c := &Conn{version: protoVersion5, compressor: comp, logger: &defaultLogger{}}
+	c.initFramerCache()
+	if c.framers.defaults.flags&frm.FlagBetaProtocol != 0 {
+		t.Error("initFramerCache(v5) seeded FlagBetaProtocol")
+	}
+}
+
+// newFramer must not set FlagCompress on v5, where compression happens at the
+// segment layer instead of via a frame-header flag.
+func Test_newFramer_compressFlag(t *testing.T) {
+	if flags := newFramer(testMockedCompressor{}, protoVersion5).flags; flags&frm.FlagCompress != 0 {
+		t.Error("newFramer(v5) should not set FlagCompress (v5 compresses at the segment layer)")
+	}
+	if flags := newFramer(testMockedCompressor{}, protoVersion4).flags; flags&frm.FlagCompress == 0 {
+		t.Error("newFramer(v4) should set FlagCompress")
 	}
 }
 

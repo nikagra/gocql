@@ -72,96 +72,31 @@ const (
 	protoVersion2      = 0x02
 	protoVersion3      = 0x03
 	protoVersion4      = 0x04
-	protoVersion5      = 0x05
+	// protoVersion5 is the final (non-beta) native protocol v5: the envelope and
+	// transport-segment layout implemented by segment.go.
+	//
+	// Requests are deliberately never marked with frm.FlagBetaProtocol. That flag
+	// opts into whatever v5 dialect the server is currently developing, which for
+	// Cassandra 3.11 is the *beta* v5 dialect — it does not use the final envelope
+	// layout, so setting the flag makes such a server accept the handshake and
+	// then fail every subsequent frame with a protocol error, instead of cleanly
+	// rejecting the version. Apache removed the same automatic opt-in in
+	// CASSGO-88 (https://issues.apache.org/jira/browse/CASSGO-88). Supporting a
+	// beta dialect would need an explicit opt-in bound to that specific dialect.
+	protoVersion5 = 0x05
 
 	maxFrameSize = 256 * 1024 * 1024
 
+	// maxSegmentPayloadSize is the largest payload a single v5 transport segment
+	// may carry (2^17 - 1). Used as a bound check when building segments.
 	maxSegmentPayloadSize = 0x1FFFF
+
+	// segmentPayloadLenMask extracts the 17-bit payload-length field from a
+	// decoded segment header. Numerically equal to maxSegmentPayloadSize, but
+	// kept separate: one is a limit, the other is a bit mask, and conflating
+	// them obscures why no explicit bound check is needed after masking.
+	segmentPayloadLenMask = 0x1FFFF
 )
-
-type protoVersion byte
-
-func (p protoVersion) request() bool {
-	return p&protoDirectionMask == 0x00
-}
-
-func (p protoVersion) response() bool {
-	return p&protoDirectionMask == 0x80
-}
-
-func (p protoVersion) version() byte {
-	return byte(p) & protoVersionMask
-}
-
-func (p protoVersion) String() string {
-	dir := "REQ"
-	if p.response() {
-		dir = "RESP"
-	}
-
-	return fmt.Sprintf("[version=%d direction=%s]", p.version(), dir)
-}
-
-type frameOp byte
-
-const (
-	// header ops
-	opError         frameOp = 0x00
-	opStartup       frameOp = 0x01
-	opReady         frameOp = 0x02
-	opAuthenticate  frameOp = 0x03
-	opOptions       frameOp = 0x05
-	opSupported     frameOp = 0x06
-	opQuery         frameOp = 0x07
-	opResult        frameOp = 0x08
-	opPrepare       frameOp = 0x09
-	opExecute       frameOp = 0x0A
-	opRegister      frameOp = 0x0B
-	opEvent         frameOp = 0x0C
-	opBatch         frameOp = 0x0D
-	opAuthChallenge frameOp = 0x0E
-	opAuthResponse  frameOp = 0x0F
-	opAuthSuccess   frameOp = 0x10
-)
-
-func (f frameOp) String() string {
-	switch f {
-	case opError:
-		return "ERROR"
-	case opStartup:
-		return "STARTUP"
-	case opReady:
-		return "READY"
-	case opAuthenticate:
-		return "AUTHENTICATE"
-	case opOptions:
-		return "OPTIONS"
-	case opSupported:
-		return "SUPPORTED"
-	case opQuery:
-		return "QUERY"
-	case opResult:
-		return "RESULT"
-	case opPrepare:
-		return "PREPARE"
-	case opExecute:
-		return "EXECUTE"
-	case opRegister:
-		return "REGISTER"
-	case opEvent:
-		return "EVENT"
-	case opBatch:
-		return "BATCH"
-	case opAuthChallenge:
-		return "AUTH_CHALLENGE"
-	case opAuthResponse:
-		return "AUTH_RESPONSE"
-	case opAuthSuccess:
-		return "AUTH_SUCCESS"
-	default:
-		return fmt.Sprintf("UNKNOWN_OP_%d", f)
-	}
-}
 
 // DEPRECATED use Consistency type, SerialConsistency is now an alias for backwards compatibility.
 type SerialConsistency = Consistency
@@ -361,25 +296,21 @@ type framer struct {
 // defaultFramerFlags computes the default header flags a framer carries for the
 // given compressor and negotiated protocol version. It is the single source of
 // truth shared by newFramer and initCache so the startup/fallback path and the
-// pooled framers cannot drift:
-//   - FlagCompress only below proto v5 (v5+ compresses at the segment layer, not
-//     via a frame header flag);
-//   - FlagBetaProtocol on proto v5 (beta opt-in must be present on the whole
-//     handshake, including OPTIONS/STARTUP/AUTH_RESPONSE).
+// pooled framers cannot drift.
 //
-// The version byte is masked with protoVersionMask before comparison, so a
-// direction/reserved high bit on the caller's version (e.g. newFramer passes the
-// unmasked byte) cannot suppress the beta flag or re-enable FlagCompress on v5.
+// Only FlagCompress is derived, and only below proto v5 (v5+ compresses at the
+// segment layer, not via a frame-header flag). It depends on the negotiated
+// compressor, so it must only be applied after startup: the server may reject the
+// requested compression, which clears c.compressor. No version-derived flag is
+// added — in particular FlagBetaProtocol is never set, see protoVersion5.
 func defaultFramerFlags(compressor Compressor, version byte) byte {
-	version &= protoVersionMask
-	var flags byte
-	if compressor != nil && version < protoVersion5 {
-		flags |= frm.FlagCompress
+	// Mask off the direction/reserved high bit: newFramer is called with the
+	// unmasked version byte, and an unmasked byte must not defeat the v5 check and
+	// re-enable frame-header compression on v5.
+	if compressor != nil && version&protoVersionMask < protoVersion5 {
+		return frm.FlagCompress
 	}
-	if version == protoVersion5 {
-		flags |= frm.FlagBetaProtocol
-	}
-	return flags
+	return 0
 }
 
 func newFramer(compressor Compressor, version byte) *framer {
@@ -458,9 +389,20 @@ type frame interface {
 }
 
 func readHeader(r io.Reader, p []byte) (head frm.FrameHeader, err error) {
-	_, err = io.ReadFull(r, p[:headSize])
+	n, err := io.ReadFull(r, p[:headSize])
 	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		// A timeout that consumed nothing is the benign idle wait for the next
+		// frame, which serve() recovers from by simply reading again. A timeout that
+		// consumed part of a header is not: the stream position is now unknown, so
+		// resuming would mis-frame everything after it. Only the former is
+		// normalised to ErrReadHeaderTimeout; the latter stays a plain error and
+		// takes the connection down.
+		//
+		// errors.As rather than a bare type assertion, matching
+		// Conn.readFirstSegmentHeader: the two timeout checks must stay in
+		// agreement even if a caller in between starts wrapping the error.
+		var netErr net.Error
+		if n == 0 && errors.As(err, &netErr) && netErr.Timeout() {
 			return frm.FrameHeader{}, fmt.Errorf("%w: %w", ErrReadHeaderTimeout, err)
 		}
 		return frm.FrameHeader{}, err
@@ -484,6 +426,7 @@ func readHeader(r io.Reader, p []byte) (head frm.FrameHeader, err error) {
 	// readFrame: a header this broken means the stream position is no longer
 	// trustworthy, and only an error out of readHeader closes the connection —
 	// readFrame's error is handed to the waiting caller while serve() reads on.
+	// recvSplitFrame applies the same bound to a reassembled frame.
 	if head.Length < 0 {
 		return frm.FrameHeader{}, fmt.Errorf("gocql: invalid frame body length: %d", head.Length)
 	}
@@ -532,9 +475,9 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 	n, err := io.ReadFull(r, f.buf)
 	if err != nil {
 		// %w, not %v: a partially read body leaves the rest of it on the wire, so
-		// the connection is desynced and must be closed. Conn.processFrame decides
-		// that with errors.As, which a %v-formatted error would defeat — the
-		// connection would be reused and every later frame mis-framed.
+		// the connection is desynced and must be closed. Conn.processFrameSource
+		// decides that with errors.As, which a %v-formatted error would defeat —
+		// the connection would be reused and every later frame mis-framed.
 		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.Length, err)
 	}
 
@@ -864,8 +807,8 @@ type writePrepareFrame struct {
 func (w *writePrepareFrame) buildFrame(f *framer, streamID int) error {
 	// Validate before writing anything into f.buf so an error never leaves a
 	// partial frame in the reusable framer buffer.
-	if w.keyspace != "" && f.proto < protoVersion5 {
-		return fmt.Errorf("gocql: keyspace can only be set with protocol v5 or higher, current protocol: %d", f.proto)
+	if err := f.validateV5Options(w.keyspace, nil); err != nil {
+		return err
 	}
 
 	if len(w.customPayload) > 0 {
@@ -1417,19 +1360,35 @@ func (q queryParams) String() string {
 		q.consistency, q.skipMeta, q.pageSize, q.pagingState, q.serialConsistency, q.defaultTimestamp, q.values, q.keyspace, q.nowInSeconds)
 }
 
-func (f *framer) writeQueryParams(opts *queryParams) error {
-	// Validate everything that can fail BEFORE writing anything into f.buf, so
-	// an error never leaves a partial frame in the reusable framer buffer.
-	if opts.keyspace != "" && f.proto < protoVersion5 {
+// validateV5Options rejects the request options that only exist from protocol v5
+// onwards, and the one v5 option whose value has to fit the wire type. Callers
+// pass nil for nowInSeconds when their frame has no such field.
+//
+// It is the single source of truth for these checks, shared by every writer that
+// accepts them (QUERY/EXECUTE via writeQueryParams, BATCH, PREPARE), so the three
+// cannot drift apart in what they reject or in what they say. Each buildFrame also
+// calls it before writing any byte, so a rejected option cannot leave a partially
+// serialised frame behind.
+func (f *framer) validateV5Options(keyspace string, nowInSeconds *int) error {
+	if keyspace != "" && f.proto < protoVersion5 {
 		return fmt.Errorf("gocql: keyspace override can only be set with protocol v5 or higher, current protocol: %d", f.proto)
 	}
-	if opts.nowInSeconds != nil {
+	if nowInSeconds != nil {
 		if f.proto < protoVersion5 {
 			return fmt.Errorf("gocql: now_in_seconds can only be set with protocol v5 or higher, current protocol: %d", f.proto)
 		}
-		if v := *opts.nowInSeconds; v < math.MinInt32 || v > math.MaxInt32 {
+		if v := *nowInSeconds; v < math.MinInt32 || v > math.MaxInt32 {
 			return fmt.Errorf("gocql: nowInSeconds value %d overflows int32", v)
 		}
+	}
+	return nil
+}
+
+func (f *framer) writeQueryParams(opts *queryParams) error {
+	// Validated again here, not only in the callers' buildFrame: this function is
+	// package-internal and nothing else would enforce the precondition.
+	if err := f.validateV5Options(opts.keyspace, opts.nowInSeconds); err != nil {
+		return err
 	}
 
 	f.writeConsistency(opts.consistency)
@@ -1541,6 +1500,15 @@ func (w *writeQueryFrame) buildFrame(framer *framer, streamID int) error {
 }
 
 func (f *framer) writeQueryFrame(streamID int, statement string, params *queryParams, customPayload map[string][]byte) error {
+	// Validate before writing anything into f.buf, as the PREPARE and BATCH
+	// builders do. writeQueryParams performs the same check, but by the time it
+	// runs the header, the custom payload and the statement have already been
+	// written, so its own "nothing was written yet" guarantee would not hold for
+	// this path.
+	if err := f.validateV5Options(params.keyspace, params.nowInSeconds); err != nil {
+		return err
+	}
+
 	if len(customPayload) > 0 {
 		f.payload()
 	}
@@ -1580,6 +1548,12 @@ func (e *writeExecuteFrame) buildFrame(fr *framer, streamID int) error {
 }
 
 func (f *framer) writeExecuteFrame(streamID int, preparedID, resultMetadataID []byte, params *queryParams, customPayload *map[string][]byte) error {
+	// Validate first, as in writeQueryFrame: the prepared id (and, on v5, the
+	// result metadata id) are written before writeQueryParams runs.
+	if err := f.validateV5Options(params.keyspace, params.nowInSeconds); err != nil {
+		return err
+	}
+
 	if len(*customPayload) > 0 {
 		f.payload()
 	}
@@ -1625,16 +1599,8 @@ func (w *writeBatchFrame) buildFrame(framer *framer, streamID int) error {
 func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame, customPayload map[string][]byte) error {
 	// Validate everything that can fail BEFORE writing anything into f.buf, so
 	// an error never leaves a partial frame in the reusable framer buffer.
-	if w.keyspace != "" && f.proto < protoVersion5 {
-		return fmt.Errorf("gocql: keyspace override can only be set with protocol v5 or higher, current protocol: %d", f.proto)
-	}
-	if w.nowInSeconds != nil {
-		if f.proto < protoVersion5 {
-			return fmt.Errorf("gocql: now_in_seconds can only be set with protocol v5 or higher, current protocol: %d", f.proto)
-		}
-		if v := *w.nowInSeconds; v < math.MinInt32 || v > math.MaxInt32 {
-			return fmt.Errorf("gocql: nowInSeconds value %d overflows int32", v)
-		}
+	if err := f.validateV5Options(w.keyspace, w.nowInSeconds); err != nil {
+		return err
 	}
 
 	// Named values are not supported in batches on any protocol version

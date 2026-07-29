@@ -2917,6 +2917,140 @@ func TestConnReaderReadReturnsDeadlineError(t *testing.T) {
 	}
 }
 
+// scriptedConn is a net.Conn whose reads come from a script and which records the
+// read deadlines it was given, so tests can drive connReader.Read's retry loop.
+type scriptedConn struct {
+	steps     []scriptedRead
+	step      int
+	deadlines []time.Time
+}
+
+var _ net.Conn = (*scriptedConn)(nil)
+
+func (c *scriptedConn) Read(p []byte) (int, error) {
+	if c.step >= len(c.steps) {
+		return 0, io.EOF
+	}
+	step := c.steps[c.step]
+	c.step++
+	return copy(p, step.data), step.err
+}
+
+func (c *scriptedConn) SetReadDeadline(t time.Time) error {
+	c.deadlines = append(c.deadlines, t)
+	return nil
+}
+func (c *scriptedConn) Write(p []byte) (int, error)      { return 0, io.ErrClosedPipe }
+func (c *scriptedConn) Close() error                     { return nil }
+func (c *scriptedConn) LocalAddr() net.Addr              { return nil }
+func (c *scriptedConn) RemoteAddr() net.Addr             { return nil }
+func (c *scriptedConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestConnReaderReadRetriesWhileMakingProgress pins connReader.Read's retry policy.
+// ReadTimeout is a per-read budget, so a large body over a slow link can legitimately
+// need more than one; but it is also the driver's "identify faulty connections early"
+// mechanism (ClusterConfig.ReadTimeout), so a peer that has actually stopped must not
+// get maxReadAttempts budgets before the connection is dropped. Progress is what
+// separates the two.
+func TestConnReaderReadRetriesWhileMakingProgress(t *testing.T) {
+	t.Parallel()
+
+	// Every step is one read attempt; a step that carries data and a timeout is a
+	// slow-but-progressing peer, a step with only a timeout is a stalled one.
+	for _, tc := range []struct {
+		name          string
+		bufLen        int
+		steps         []scriptedRead
+		wantN         int
+		wantErr       bool
+		wantDeadlines int
+	}{
+		{
+			// The fault-detection guarantee: nothing delivered means the peer stopped,
+			// so this fails within one ReadTimeout even though data would follow.
+			name:          "empty timeout is not resumed",
+			bufLen:        4,
+			steps:         []scriptedRead{{err: timeoutErr{}}, {data: []byte{1, 2, 3, 4}}},
+			wantN:         0,
+			wantErr:       true,
+			wantDeadlines: 1,
+		},
+		{
+			// The tolerance guarantee: bytes accumulate across attempts and no data is
+			// dropped, so a body slower than one ReadTimeout still completes.
+			name:   "accumulates across progressing attempts",
+			bufLen: 4,
+			steps: []scriptedRead{
+				{data: []byte{1}, err: timeoutErr{}},
+				{data: []byte{2}, err: timeoutErr{}},
+				{data: []byte{3, 4}},
+			},
+			wantN:         4,
+			wantDeadlines: 3,
+		},
+		{
+			name:   "stops once progress stops",
+			bufLen: 4,
+			steps: []scriptedRead{
+				{data: []byte{1}, err: timeoutErr{}},
+				{err: timeoutErr{}},
+				{data: []byte{2, 3, 4}},
+			},
+			wantN:         1,
+			wantErr:       true,
+			wantDeadlines: 2,
+		},
+		{
+			// A non-timeout network error is not resumable, whatever Temporary() says
+			// about it — the stream position can no longer be trusted.
+			name:   "non-timeout net error is not retried",
+			bufLen: 4,
+			steps: []scriptedRead{
+				{data: []byte{1}, err: &net.OpError{Op: "read", Err: errors.New("connection reset by peer")}},
+				{data: []byte{2, 3, 4}},
+			},
+			wantN:         1,
+			wantErr:       true,
+			wantDeadlines: 1,
+		},
+		{
+			// Bounded: a peer trickling one byte per ReadTimeout forever still fails,
+			// after maxReadAttempts.
+			name:   "gives up after maxReadAttempts",
+			bufLen: 10,
+			steps: []scriptedRead{
+				{data: []byte{1}, err: timeoutErr{}},
+				{data: []byte{2}, err: timeoutErr{}},
+				{data: []byte{3}, err: timeoutErr{}},
+				{data: []byte{4}, err: timeoutErr{}},
+				{data: []byte{5}, err: timeoutErr{}},
+				{data: []byte{6}, err: timeoutErr{}},
+			},
+			wantN:         maxReadAttempts,
+			wantErr:       true,
+			wantDeadlines: maxReadAttempts,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &scriptedConn{steps: tc.steps}
+			cr := &connReader{conn: mock, r: bufio.NewReader(mock)}
+			cr.SetTimeout(time.Second)
+
+			n, err := cr.Read(make([]byte, tc.bufLen))
+
+			require.Equal(t, tc.wantN, n)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Len(t, mock.deadlines, tc.wantDeadlines,
+				"one fresh read deadline per attempt")
+		})
+	}
+}
+
 // TestConnReadDelegatesToConnReader verifies that the exported (*Conn).Read is
 // wired to the connection's ConnReader, so *Conn keeps satisfying io.Reader for
 // external callers after the ConnReader refactor.
@@ -2933,12 +3067,15 @@ func TestConnReadDelegatesToConnReader(t *testing.T) {
 	require.Equal(t, payload, buf)
 }
 
-// scriptedReadSource is a ConnReader whose reads come from a script of
-// (bytes, error) steps. It lets tests drive partial reads and timing-out reads
-// without a socket, and it can be installed as Conn.r.
+// scriptedReadSource is a connReadSource whose reads come from a script of
+// (bytes, error) steps and which records every setDisarm transition. It lets tests
+// drive partial reads, timing-out reads and the disarm/re-arm pairing without a
+// socket, and — being a connReadSource — it can be installed as Conn.r.
 type scriptedReadSource struct {
-	steps []scriptedRead
-	step  int
+	steps   []scriptedRead
+	step    int
+	disarms []bool // every value passed to setDisarm, in order
+	arms    int    // reads started while not disarmed
 }
 
 type scriptedRead struct {
@@ -2946,7 +3083,12 @@ type scriptedRead struct {
 	err  error
 }
 
+var _ connReadSource = (*scriptedReadSource)(nil)
+
 func (s *scriptedReadSource) Read(p []byte) (int, error) {
+	if len(s.disarms) == 0 || !s.disarms[len(s.disarms)-1] {
+		s.arms++
+	}
 	if s.step >= len(s.steps) {
 		return 0, io.EOF
 	}
@@ -2960,6 +3102,7 @@ func (s *scriptedReadSource) Close() error               { return nil }
 func (s *scriptedReadSource) RemoteAddr() net.Addr       { return nil }
 func (s *scriptedReadSource) SetTimeout(_ time.Duration) {}
 func (s *scriptedReadSource) GetTimeout() time.Duration  { return 0 }
+func (s *scriptedReadSource) setDisarm(v bool)           { s.disarms = append(s.disarms, v) }
 
 // timeoutErr is a net.Error reporting a timeout, standing in for the
 // os.ErrDeadlineExceeded a real socket returns once its read deadline expires.
@@ -2970,6 +3113,54 @@ func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return true }
 
 var _ net.Error = timeoutErr{}
+
+// TestHeaderReadTimeoutIsBenignOnlyWhenNothingWasConsumed pins the line between
+// the two kinds of header-read timeout, for both header readers.
+//
+// Consumed nothing: the peer was simply idle, serve() logs ErrReadHeaderTimeout and
+// reads again. Consumed part of a header: the stream is now at an unknown offset, so
+// the error must NOT be normalised — serve() has to close the connection instead of
+// resuming and mis-framing every frame that follows.
+func TestHeaderReadTimeoutIsBenignOnlyWhenNothingWasConsumed(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		steps     []scriptedRead
+		wantIsErr bool
+	}{
+		{
+			name:      "nothing consumed",
+			steps:     []scriptedRead{{err: timeoutErr{}}},
+			wantIsErr: true,
+		},
+		{
+			name:      "partial header consumed",
+			steps:     []scriptedRead{{data: []byte{0x84, 0x00, 0x00, 0x01}, err: timeoutErr{}}},
+			wantIsErr: false,
+		},
+	} {
+		t.Run("frame header/"+tc.name, func(t *testing.T) {
+			c := &Conn{r: &scriptedReadSource{steps: tc.steps}}
+
+			_, err := c.readFrameHeader(c.r)
+
+			require.Error(t, err)
+			require.Equal(t, tc.wantIsErr, errors.Is(err, ErrReadHeaderTimeout),
+				"errors.Is(ErrReadHeaderTimeout) on %q", err)
+		})
+
+		t.Run("segment header/"+tc.name, func(t *testing.T) {
+			c := &Conn{r: &scriptedReadSource{steps: tc.steps}}
+
+			_, err := c.readFirstSegmentHeader()
+
+			require.Error(t, err)
+			require.Equal(t, tc.wantIsErr, errors.Is(err, ErrReadHeaderTimeout),
+				"errors.Is(ErrReadHeaderTimeout) on %q", err)
+		})
+	}
+}
 
 // TestProcessFrameDesyncedBodyIsFatalAndWakesCaller pins the two halves of what
 // has to happen when a frame body cannot be read off the wire:
@@ -3017,6 +3208,34 @@ func TestProcessFrameDesyncedBodyIsFatalAndWakesCaller(t *testing.T) {
 		require.ErrorIs(t, resp.err, err, "the waiting caller must be handed the same failure")
 	default:
 		t.Fatal("the call was never woken: it would wait out its full request timeout")
+	}
+}
+
+// TestReadFirstSegmentHeaderDisarmsAndRearms pins that the idle wait for a segment
+// header runs with the read deadline disarmed and that the deadline is restored on
+// every exit path — including the error path, where a missed re-arm would leave the
+// connection reading with no deadline for the rest of its life.
+func TestReadFirstSegmentHeaderDisarmsAndRearms(t *testing.T) {
+	t.Parallel()
+
+	header := mustUncompressedSegment(t, []byte("hello"), true)
+
+	for _, tc := range []struct {
+		name  string
+		steps []scriptedRead
+	}{
+		{"header read succeeds", []scriptedRead{{data: header}}},
+		{"header read fails", []scriptedRead{{err: timeoutErr{}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &scriptedReadSource{steps: tc.steps}
+			c := &Conn{r: r}
+
+			_, _ = c.readFirstSegmentHeader()
+
+			require.Equal(t, []bool{true, false}, r.disarms,
+				"the header read must be bracketed by exactly one disarm and one re-arm")
+		})
 	}
 }
 
@@ -3152,3 +3371,63 @@ func TestRecvSegmentPayloadReadIsBounded(t *testing.T) {
 		t.Fatal("recvSegment hung on the payload read; the read deadline was not re-armed after the segment header")
 	}
 }
+
+// TestStartupOptionsKeepDriverKeys pins that ApplicationInfo cannot overwrite the
+// STARTUP options the driver owns.
+//
+// CQL_VERSION, DRIVER_NAME and DRIVER_VERSION describe the driver and the
+// protocol it speaks. A callback that set CQL_VERSION could make every connection
+// in the cluster fail its handshake; one that set DRIVER_NAME or DRIVER_VERSION
+// would misreport the driver to the server for the life of the connection.
+func TestStartupOptionsKeepDriverKeys(t *testing.T) {
+	t.Parallel()
+
+	const (
+		cqlVersion    = "3.4.5"
+		driverName    = "gocql"
+		driverVersion = "1.2.3"
+	)
+
+	t.Run("no ApplicationInfo", func(t *testing.T) {
+		m := startupOptions(cqlVersion, driverName, driverVersion, nil)
+
+		require.Equal(t, map[string]string{
+			"CQL_VERSION":    cqlVersion,
+			"DRIVER_NAME":    driverName,
+			"DRIVER_VERSION": driverVersion,
+		}, m)
+	})
+
+	t.Run("application options are kept", func(t *testing.T) {
+		m := startupOptions(cqlVersion, driverName, driverVersion,
+			NewStaticApplicationInfo("app", "9.9.9", "client-id"))
+
+		require.Equal(t, "app", m["APPLICATION_NAME"])
+		require.Equal(t, "9.9.9", m["APPLICATION_VERSION"])
+		require.Equal(t, "client-id", m["CLIENT_ID"])
+		require.Equal(t, cqlVersion, m["CQL_VERSION"])
+		require.Equal(t, driverName, m["DRIVER_NAME"])
+		require.Equal(t, driverVersion, m["DRIVER_VERSION"])
+	})
+
+	t.Run("driver-owned keys win", func(t *testing.T) {
+		m := startupOptions(cqlVersion, driverName, driverVersion,
+			applicationInfoFunc(func(opts map[string]string) {
+				opts["CQL_VERSION"] = "9.9.9"
+				opts["DRIVER_NAME"] = "not-gocql"
+				opts["DRIVER_VERSION"] = "0.0.0"
+				opts["APPLICATION_NAME"] = "app"
+			}))
+
+		require.Equal(t, cqlVersion, m["CQL_VERSION"], "a custom CQL version would fail every handshake")
+		require.Equal(t, driverName, m["DRIVER_NAME"])
+		require.Equal(t, driverVersion, m["DRIVER_VERSION"])
+		require.Equal(t, "app", m["APPLICATION_NAME"], "keys the driver does not own must still come through")
+	})
+}
+
+// applicationInfoFunc adapts a function to ApplicationInfo, so a test can supply
+// options StaticApplicationInfo would never produce.
+type applicationInfoFunc func(map[string]string)
+
+func (f applicationInfoFunc) UpdateStartupOptions(opts map[string]string) { f(opts) }

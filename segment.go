@@ -137,7 +137,7 @@ func readUncompressedSegmentHeader(r io.Reader) (segmentHeader, error) {
 
 	headerInt := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16
 	return segmentHeader{
-		payloadLen:      int(headerInt & maxSegmentPayloadSize),
+		payloadLen:      int(headerInt & segmentPayloadLenMask),
 		isSelfContained: (headerInt & (1 << 17)) != 0,
 	}, nil
 }

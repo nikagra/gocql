@@ -36,11 +36,18 @@ import (
 	"github.com/gocql/gocql/internal/streams"
 )
 
-// segmentReader is a minimal ConnReader backed by an in-memory byte stream,
+// segmentReader is a minimal connReadSource backed by an in-memory byte stream,
 // used to drive the v5 segment reassembly path without a real socket.
 type segmentReader struct {
 	r *bytes.Reader
+	// disarmed records the current disarm state. There is no deadline to disarm on
+	// an in-memory stream, but implementing it is what keeps this reader usable as
+	// Conn.r — a reader that could not be disarmed would silently exercise the
+	// receive path with the idle-wait handling switched off.
+	disarmed bool
 }
+
+var _ connReadSource = (*segmentReader)(nil)
 
 func newSegmentReader(b []byte) *segmentReader {
 	return &segmentReader{r: bytes.NewReader(b)}
@@ -51,6 +58,7 @@ func (s *segmentReader) Close() error               { return nil }
 func (s *segmentReader) RemoteAddr() net.Addr       { return nil }
 func (s *segmentReader) SetTimeout(_ time.Duration) {}
 func (s *segmentReader) GetTimeout() time.Duration  { return 0 }
+func (s *segmentReader) setDisarm(v bool)           { s.disarmed = v }
 
 // mustUncompressedSegment builds a single uncompressed transport segment
 // carrying payload, failing the test on error.
@@ -325,7 +333,7 @@ func TestRecvSegmentObservesHeaderOverTheNetworkRead(t *testing.T) {
 	// not to slow the suite. Only ever asserted as a lower bound.
 	const stall = 30 * time.Millisecond
 
-	newConn := func(r ConnReader, observer *recordingFrameHeaderObserver) *Conn {
+	newConn := func(r connReadSource, observer *recordingFrameHeaderObserver) *Conn {
 		c := &Conn{
 			r:             r,
 			streams:       streams.New(),
