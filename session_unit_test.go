@@ -4152,38 +4152,94 @@ func TestBatchAttemptReportsOverrideKeyspaceToObserver(t *testing.T) {
 	}
 }
 
-// TestQueryKeyspaceConcurrentWithRoutingInfoWrite exercises Query.Keyspace()
-// concurrently with a writer mutating routingInfo.keyspace under routingInfo.mu
-// (as GetRoutingKey does). queryExecutor.attemptQuery calls Keyspace() from every
-// speculative execution goroutine, so the read must take routingInfo.mu; under
-// -race this fails if the lock is dropped.
-func TestQueryKeyspaceConcurrentWithRoutingInfoWrite(t *testing.T) {
-	q := &Query{
-		routingInfo: &queryRoutingInfo{},
-	}
+// TestQueryRoutingInfoAccessorsConcurrentWithWrite exercises every accessor that
+// reads queryRoutingInfo concurrently with a writer mutating it under
+// routingInfo.mu (as GetRoutingKey and Conn.executeQuery both do).
+//
+// Both keyspace and table are covered: the token-aware host policy reads them
+// together (policies.go, scylla.go call qry.Keyspace() and qry.Table() in one
+// expression) from every speculative execution goroutine, so both reads must
+// take routingInfo.mu. Under -race this fails if either lock is dropped.
+//
+// The writer alternates between values of differing length so the unsynchronized
+// case is a genuine torn-read of the string header, not just a formal race.
+func TestQueryRoutingInfoAccessorsConcurrentWithWrite(t *testing.T) {
+	const iterations = 1000
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Writer: mimic GetRoutingKey updating routingInfo under the lock.
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 1000; i++ {
-			q.routingInfo.mu.Lock()
-			q.routingInfo.keyspace = "ks"
-			q.routingInfo.mu.Unlock()
+	t.Run("Query", func(t *testing.T) {
+		q := &Query{
+			routingInfo: &queryRoutingInfo{},
 		}
-	}()
 
-	// Reader: mimic attemptQuery reading the effective keyspace.
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 1000; i++ {
-			_ = q.Keyspace()
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Writer: mimic GetRoutingKey/executeQuery updating routingInfo under the lock.
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				q.routingInfo.mu.Lock()
+				if i%2 == 0 {
+					q.routingInfo.keyspace, q.routingInfo.table = "ks", "tbl"
+				} else {
+					q.routingInfo.keyspace, q.routingInfo.table = "a_much_longer_keyspace", "a_much_longer_table"
+				}
+				q.routingInfo.mu.Unlock()
+			}
+		}()
+
+		// Reader: mimic attemptQuery and the token-aware policy reading both fields,
+		// plus the pair read Conn.executeQuery does for a tablet-routing hint. The
+		// pair must come from one critical section: keyspace and table are always
+		// written together, so reading them separately can pair one goroutine's
+		// keyspace with another's table even with both reads individually locked.
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = q.Keyspace()
+				_ = q.Table()
+
+				ks, tbl := q.routingInfo.keyspaceTable()
+				if (ks == "ks") != (tbl == "tbl") {
+					t.Errorf("keyspaceTable() returned a mismatched pair: %q / %q", ks, tbl)
+				}
+			}
+		}()
+
+		wg.Wait()
+	})
+
+	t.Run("Batch", func(t *testing.T) {
+		b := &Batch{
+			routingInfo: &queryRoutingInfo{},
 		}
-	}()
 
-	wg.Wait()
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				b.routingInfo.mu.Lock()
+				if i%2 == 0 {
+					b.routingInfo.table = "tbl"
+				} else {
+					b.routingInfo.table = "a_much_longer_table"
+				}
+				b.routingInfo.mu.Unlock()
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = b.Keyspace()
+				_ = b.Table()
+			}
+		}()
+
+		wg.Wait()
+	})
 }
 
 // TestResolveRoutingKeyspaceTable pins the precedence used to pick the keyspace

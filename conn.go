@@ -2042,6 +2042,15 @@ func (c *Conn) executeQueryWithMetrics(ctx context.Context, qry *Query, metrics 
 		info  *preparedStatment
 	)
 
+	// The keyspace and table this attempt routes by, used below to attribute a
+	// tablet-routing hint. Held in locals rather than read back out of
+	// qry.routingInfo: one *Query (and one *queryRoutingInfo) is shared by every
+	// speculative execution goroutine and by the auto-paging copy, so a sibling
+	// goroutine can overwrite the cached pair between the write below and the read
+	// at the end of this function. Seeded from the cache for the non-prepared path,
+	// where only GetRoutingKey has written it.
+	routingKeyspace, routingTable := qry.routingInfo.keyspaceTable()
+
 	if !qry.skipPrepare && qry.shouldPrepare() {
 		// Prepare all DML queries. Other queries can not be prepared.
 		var err error
@@ -2089,13 +2098,16 @@ func (c *Conn) executeQueryWithMetrics(ctx context.Context, qry *Query, metrics 
 		}
 
 		// Set "lwt", keyspace", "table" property in the query if it is present in preparedMetadata
+		routingKeyspace = info.request.keyspace
+		if routingKeyspace == "" {
+			routingKeyspace = usedKeyspace
+		}
+		routingTable = info.request.table
+
 		qry.routingInfo.mu.Lock()
 		qry.routingInfo.lwt = info.request.lwt
-		qry.routingInfo.keyspace = info.request.keyspace
-		if info.request.keyspace == "" {
-			qry.routingInfo.keyspace = usedKeyspace
-		}
-		qry.routingInfo.table = info.request.table
+		qry.routingInfo.keyspace = routingKeyspace
+		qry.routingInfo.table = routingTable
 		qry.routingInfo.mu.Unlock()
 	} else {
 		frame = &writeQueryFrame{
@@ -2122,7 +2134,7 @@ func (c *Conn) executeQueryWithMetrics(ctx context.Context, qry *Query, metrics 
 
 	if len(framer.customPayload) > 0 {
 		if hint, ok := framer.customPayload["tablets-routing-v1"]; ok {
-			tablet, err := unmarshalTabletHint(hint, c.version, qry.routingInfo.keyspace, qry.routingInfo.table)
+			tablet, err := unmarshalTabletHint(hint, c.version, routingKeyspace, routingTable)
 			if err != nil {
 				return newErrorIterWithReleasedFramer(err, framer).
 					bindWarningHandlerWithMetrics(qry, metrics, warningHandler)

@@ -1841,6 +1841,16 @@ func (qri *queryRoutingInfo) getPartitioner() Partitioner {
 	return qri.partitioner
 }
 
+// keyspaceTable returns the cached keyspace and table together, under a single
+// lock. They are always written as a pair (by GetRoutingKey and by
+// Conn.executeQuery), so reading them in one critical section is what keeps a
+// reader from pairing one goroutine's keyspace with another's table.
+func (qri *queryRoutingInfo) keyspaceTable() (string, string) {
+	qri.mu.RLock()
+	defer qri.mu.RUnlock()
+	return qri.keyspace, qri.table
+}
+
 func (q *Query) defaultsFromSession() {
 	s := q.session
 
@@ -2136,6 +2146,12 @@ func (q *Query) Keyspace() string {
 
 // Table returns name of the table the query will be executed against.
 func (q *Query) Table() string {
+	// routingInfo.table is written under routingInfo.mu by GetRoutingKey and by
+	// Conn.executeQuery, either of which can run concurrently with the
+	// (speculative) execution goroutines that reach Table() via the token-aware
+	// host policy. Read it under the same lock, matching Query.Keyspace().
+	q.routingInfo.mu.RLock()
+	defer q.routingInfo.mu.RUnlock()
 	return q.routingInfo.table
 }
 
@@ -3335,6 +3351,12 @@ func (b *Batch) Keyspace() string {
 
 // Batch has no reasonable eqivalent of Query.Table().
 func (b *Batch) Table() string {
+	// Read under routingInfo.mu for the same reason as Query.Table(). Nothing
+	// currently writes batch.routingInfo.table (Conn.executeBatch only sets
+	// lwt), but leaving one of the two accessors unlocked is how the Query.Table
+	// race was introduced in the first place.
+	b.routingInfo.mu.RLock()
+	defer b.routingInfo.mu.RUnlock()
 	return b.routingInfo.table
 }
 
