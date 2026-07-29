@@ -109,7 +109,7 @@ func TestRecvSplitFrameRejectsOverlongStream(t *testing.T) {
 	seg := mustUncompressedSegment(t, []byte("01234567"), false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	err := c.recvSplitFrame(context.Background(), header)
+	err := c.recvSplitFrame(context.Background(), header, time.Time{}, time.Time{})
 	if err == nil || !strings.Contains(err.Error(), "exceeds its declared length") {
 		t.Fatalf("expected over-long rejection, got %v", err)
 	}
@@ -190,7 +190,7 @@ func TestRecvSplitFrameRejectsOversizedLength(t *testing.T) {
 	seg := mustUncompressedSegment(t, header, false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	err := c.recvSplitFrame(context.Background(), nil)
+	err := c.recvSplitFrame(context.Background(), nil, time.Time{}, time.Time{})
 	if err == nil || !strings.Contains(err.Error(), "invalid frame body length") {
 		t.Fatalf("expected oversized-length rejection, got %v", err)
 	}
@@ -205,7 +205,7 @@ func TestRecvSplitFrameRejectsTruncatedHeaderStream(t *testing.T) {
 	seg := mustUncompressedSegment(t, []byte("abcd"), false)
 	c := &Conn{r: newSegmentReader(seg)}
 
-	err := c.recvSplitFrame(context.Background(), nil)
+	err := c.recvSplitFrame(context.Background(), nil, time.Time{}, time.Time{})
 	if err == nil {
 		t.Fatalf("expected error on truncated header stream, got nil")
 	}
@@ -290,6 +290,100 @@ func TestProcessAllFramesInSegmentBoundsFrameLength(t *testing.T) {
 
 		if err := c.recvSegment(context.Background()); err != nil {
 			t.Fatalf("a frame whose body ends exactly at the segment boundary must be accepted, got %v", err)
+		}
+	})
+}
+
+// slowSegmentReader stalls once, on the first read that reaches delayFrom, so a
+// test can put a known lower bound on how long a chosen part of the receive path
+// spent waiting on the network.
+type slowSegmentReader struct {
+	*segmentReader
+	delayFrom int64
+	delay     time.Duration
+	stalled   bool
+}
+
+func (s *slowSegmentReader) Read(p []byte) (int, error) {
+	if !s.stalled && s.r.Size()-int64(s.r.Len()) >= s.delayFrom {
+		s.stalled = true
+		time.Sleep(s.delay)
+	}
+	return s.segmentReader.Read(p)
+}
+
+// TestRecvSegmentObservesHeaderOverTheNetworkRead pins FrameHeaderObserver's
+// documented contract on v5: Start and End bracket the header coming off the
+// network, not the parse.
+//
+// On v5 the whole segment is read before any CQL header is looked at, so timing
+// the header read where it happens measures a bytes.Reader — the window collapses
+// to nanoseconds and the network wait, which is the thing worth observing, is
+// reported by nobody.
+func TestRecvSegmentObservesHeaderOverTheNetworkRead(t *testing.T) {
+	// Long enough that an in-memory parse cannot be mistaken for it, short enough
+	// not to slow the suite. Only ever asserted as a lower bound.
+	const stall = 30 * time.Millisecond
+
+	newConn := func(r ConnReader, observer *recordingFrameHeaderObserver) *Conn {
+		c := &Conn{
+			r:             r,
+			streams:       streams.New(),
+			logger:        &defaultLogger{},
+			frameObserver: observer,
+		}
+		c.initFramerCache()
+		return c
+	}
+
+	t.Run("self-contained segment", func(t *testing.T) {
+		seg := mustUncompressedSegment(t, v5ReadyFrame(0, nil), true)
+		observer := &recordingFrameHeaderObserver{t: t}
+		// Stall before the very first byte: the whole segment read is inside the
+		// window the observer should report.
+		c := newConn(&slowSegmentReader{segmentReader: newSegmentReader(seg), delay: stall}, observer)
+
+		if err := c.recvSegment(context.Background()); err != nil {
+			t.Fatalf("recvSegment: %v", err)
+		}
+
+		frames := observer.getFrames()
+		if len(frames) != 1 {
+			t.Fatalf("expected 1 observed header, got %d", len(frames))
+		}
+		if got := frames[0].End.Sub(frames[0].Start); got < stall {
+			t.Errorf("observed header window is %v, want at least the %v the segment read stalled: "+
+				"Start/End are timing the parse, not the network read", got, stall)
+		}
+	})
+
+	t.Run("header split across segments", func(t *testing.T) {
+		// Two bytes of the CQL header in the first segment, the rest plus the body
+		// in the second, so the header is only complete after a second network read.
+		frame := v5ReadyFrame(0, nil)
+		first := mustUncompressedSegment(t, frame[:2], false)
+		stream := append(append([]byte{}, first...), mustUncompressedSegment(t, frame[2:], false)...)
+
+		observer := &recordingFrameHeaderObserver{t: t}
+		// Stall on the second segment only, so the window can only cover it if
+		// recvSplitFrame extended End past the first.
+		c := newConn(&slowSegmentReader{
+			segmentReader: newSegmentReader(stream),
+			delayFrom:     int64(len(first)),
+			delay:         stall,
+		}, observer)
+
+		if err := c.recvSegment(context.Background()); err != nil {
+			t.Fatalf("recvSegment: %v", err)
+		}
+
+		frames := observer.getFrames()
+		if len(frames) != 1 {
+			t.Fatalf("expected 1 observed header, got %d", len(frames))
+		}
+		if got := frames[0].End.Sub(frames[0].Start); got < stall {
+			t.Errorf("observed header window is %v, want at least the %v the second segment stalled: "+
+				"End was not extended to when the header finished arriving", got, stall)
 		}
 	})
 }

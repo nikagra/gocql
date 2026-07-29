@@ -895,6 +895,15 @@ type frameSource struct {
 	// Nil on the pre-v5 socket path, and nil for a reassembled frame, where
 	// framer.adoptFrameBody already matches the declared length exactly.
 	segment *bytes.Reader
+	// netStart/netEnd are the window of the network read that delivered these
+	// bytes, for FrameHeaderObserver. On v5 the CQL header is parsed out of a
+	// segment that has already arrived, so processFrameSource cannot measure the
+	// network wait itself — the reader that could is recvSegment, and it passes
+	// the window down here.
+	//
+	// Zero means "not measured", which is the pre-v5 socket path: there
+	// processFrameSource reads the header off the wire and times it directly.
+	netStart, netEnd time.Time
 }
 
 // readBody fills f with the frame body described by head, either by reading it
@@ -934,15 +943,20 @@ func (c *Conn) processFrameSource(ctx context.Context, src frameSource) error {
 	// not safe for concurrent reads
 	r := src.r
 
-	var headStartTime time.Time
-	if c.frameObserver != nil {
+	// The observer documents Start/End as when the header started and finished
+	// coming off the network. When the caller already did that read and measured
+	// it (v5: the header is parsed out of a segment that has arrived), its window
+	// is the truthful one; timing the parse here would report memory speed.
+	headStartTime, headEndTime := src.netStart, src.netEnd
+	measureHere := headStartTime.IsZero() && c.frameObserver != nil
+
+	if measureHere {
 		headStartTime = time.Now()
 	}
 	// were just reading headers over and over and copy bodies
 	head, err := c.readFrameHeader(r)
 
-	var headEndTime time.Time
-	if c.frameObserver != nil {
+	if measureHere {
 		headEndTime = time.Now()
 	}
 	if err != nil {
@@ -1108,6 +1122,13 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 	// to assemble a frame. A peer that keeps trickling progress just under
 	// ReadTimeout is instead bounded by the frame length recvSplitFrame enforces
 	// against the reassembled size.
+	//
+	// netStart/netEnd bracket this read for FrameHeaderObserver. The CQL headers
+	// inside are parsed out of memory further down, so timing them there would
+	// report the parse rather than the network wait the observer documents; the
+	// window is measured here and carried to processFrameSource instead. Sampled
+	// only when an observer is installed, so an unobserved connection pays nothing.
+	netStart := c.observedNow()
 	hdr, err := c.readFirstSegmentHeader()
 	if err != nil {
 		return err
@@ -1117,16 +1138,28 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	netEnd := c.observedNow()
 
 	if hdr.isSelfContained {
 		// The segment holds one or more complete CQL frames.
-		return c.processAllFramesInSegment(ctx, bytes.NewReader(payload))
+		return c.processAllFramesInSegment(ctx, bytes.NewReader(payload), netStart, netEnd)
 	}
 
 	// The segment is the first slice of a single large CQL frame split across
 	// several non-self-contained segments; reassemble the whole frame before
 	// processing it.
-	return c.recvSplitFrame(ctx, payload)
+	return c.recvSplitFrame(ctx, payload, netStart, netEnd)
+}
+
+// observedNow returns the current time when a frame header observer is
+// installed, and the zero time otherwise. Callers thread the result into
+// frameSource, where a zero value means "not measured" and processFrameSource
+// falls back to timing the header read itself.
+func (c *Conn) observedNow() time.Time {
+	if c.frameObserver == nil {
+		return time.Time{}
+	}
+	return time.Now()
 }
 
 // readFirstSegmentHeader reads the header of the next segment while the read
@@ -1170,7 +1203,12 @@ func (c *Conn) readFirstSegmentHeader() (segmentHeader, error) {
 // growing a buffer to a maxFrameSize frame would end up holding ~512 MiB for a
 // valid 256 MiB response. Ownership of the buffer is then handed to the read
 // framer rather than copied into it, so the frame is never resident twice.
-func (c *Conn) recvSplitFrame(ctx context.Context, first []byte) error {
+//
+// netStart/netEnd are the network-read window of the first segment, for
+// FrameHeaderObserver. netEnd is extended below if the CQL header itself needed
+// more segments to arrive — but only that far: the observer's End is when the
+// header finished arriving, not the rest of the frame.
+func (c *Conn) recvSplitFrame(ctx context.Context, first []byte, netStart, netEnd time.Time) error {
 	// The CQL frame header may itself be split across segments, in which case the
 	// frame length cannot be learnt from the first segment alone. Accumulate into a
 	// local buffer until the header is complete; this is bounded by one segment
@@ -1187,6 +1225,7 @@ func (c *Conn) recvSplitFrame(ctx context.Context, first []byte) error {
 			accumulated = append(accumulated, payload...)
 		}
 		first = accumulated
+		netEnd = c.observedNow()
 	}
 
 	// Peek the CQL frame header (without consuming it — processFrame re-reads it
@@ -1220,7 +1259,12 @@ func (c *Conn) recvSplitFrame(ctx context.Context, first []byte) error {
 	// instead of allocating and copying another frame-sized buffer. The header is
 	// still read from the front of the same bytes, so processFrame observes and
 	// validates it exactly as it does for an unsegmented frame.
-	return c.processFrameSource(ctx, frameSource{r: bytes.NewReader(frame), body: frame[headSize:]})
+	return c.processFrameSource(ctx, frameSource{
+		r:        bytes.NewReader(frame),
+		body:     frame[headSize:],
+		netStart: netStart,
+		netEnd:   netEnd,
+	})
 }
 
 // readContinuationSegment reads the next segment of a frame split across several
@@ -1247,7 +1291,7 @@ func (c *Conn) readContinuationSegment() ([]byte, error) {
 	return payload, nil
 }
 
-func (c *Conn) processAllFramesInSegment(ctx context.Context, r *bytes.Reader) error {
+func (c *Conn) processAllFramesInSegment(ctx context.Context, r *bytes.Reader, netStart, netEnd time.Time) error {
 	// A self-contained segment carries one or more complete CQL frames, so we
 	// drain them all. This is safe to iterate: the segment payload has already
 	// been CRC32-verified, and processFrameSource consumes exactly one frame
@@ -1260,9 +1304,18 @@ func (c *Conn) processAllFramesInSegment(ctx context.Context, r *bytes.Reader) e
 	// r is passed as the segment as well as the reader, which is what bounds each
 	// frame's declared body length by the bytes actually left in the segment (see
 	// frameSource).
+	//
+	// Every frame packed into this segment reports the same observer window: they
+	// did all arrive in the one network read, and attributing a slice of it to
+	// each would be an invention.
 	var err error
 	for r.Len() > 0 && err == nil {
-		err = c.processFrameSource(ctx, frameSource{r: r, segment: r})
+		err = c.processFrameSource(ctx, frameSource{
+			r:        r,
+			segment:  r,
+			netStart: netStart,
+			netEnd:   netEnd,
+		})
 	}
 
 	return err

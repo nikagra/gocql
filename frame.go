@@ -281,8 +281,17 @@ const defaultBufSize = 128
 
 type ObservedFrameHeader struct {
 	// StartHeader is the time we started reading the frame header off the network connection.
+	//
+	// On protocol v5 the header arrives inside a transport segment, so this is
+	// when the read of that segment began. Frames packed into one self-contained
+	// segment therefore share a window: they did all arrive in the same read.
 	Start time.Time
 	// EndHeader is the time we finished reading the frame header off the network connection.
+	//
+	// On protocol v5 this is when the segment carrying the header had been read —
+	// or, for a frame whose header is itself split across segments, when the last
+	// segment needed to complete the 9 header bytes arrived. It is not extended to
+	// cover the rest of a frame spanning further segments.
 	End time.Time
 	// Host is Host of the connection the frame header was read from.
 	Host    *HostInfo
