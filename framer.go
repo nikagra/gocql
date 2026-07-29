@@ -284,6 +284,10 @@ func (fp *framerPool) resetAndPut(f *framer, alignBufWithReadBuffer bool, shrink
 		buf := make([]byte, shrinkSize)
 		f.readBuffer = buf
 		f.buf = buf[:0]
+		// The v5 wire buffer (prepareModernLayout) is sized after the frame it
+		// segmented, so it has to be dropped along with an oversized f.buf,
+		// otherwise a single large request keeps bloating this pooled framer.
+		f.wireBuf = nil
 		fp.put(f)
 		return
 	}

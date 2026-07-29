@@ -329,13 +329,18 @@ const headSize = 9
 
 // a framer is responsible for reading, writing and parsing frames on a single stream
 type framer struct {
-	compressor            Compressor
-	header                *frm.FrameHeader
-	customPayload         map[string][]byte
-	release               func()
-	traceID               []byte
-	readBuffer            []byte
-	buf                   []byte
+	compressor    Compressor
+	header        *frm.FrameHeader
+	customPayload map[string][]byte
+	release       func()
+	traceID       []byte
+	readBuffer    []byte
+	buf           []byte
+	// wireBuf is the framer's second reusable byte buffer. prepareModernLayout
+	// encodes the v5 transport segments into it and then swaps it with buf, so a
+	// framer reused for consecutive v5 requests keeps both the raw-frame buffer
+	// and the wire buffer alive instead of allocating a new one per request.
+	wireBuf               []byte
 	flagLWT               int
 	rateLimitingErrorCode int
 	flags                 byte
@@ -2068,54 +2073,91 @@ func (f *framer) writeBytesMap(m map[string][]byte) {
 	}
 }
 
+// prepareModernLayout rewrites the framer's buffer from a bare CQL frame into the
+// v5 wire format: one transport segment if the frame fits in one, otherwise a
+// chain of non-self-contained segments (see segment.go).
+//
+// Segment headers, payloads and CRCs are encoded straight into f.wireBuf, sized
+// up front so appending never has to grow it, and nothing per-segment is
+// allocated on the way. f.buf and f.wireBuf are then swapped, which both hands
+// the caller the wire bytes in f.buf and keeps the raw-frame buffer alive as
+// f.wireBuf for the next request on this framer.
 func (f *framer) prepareModernLayout() error {
 	// Ensure protocol version is V5 or higher
 	if f.proto < protoVersion5 {
 		return fmt.Errorf("gocql: modern layout is not supported with protocol version %d (requires v5+)", f.proto)
 	}
 
-	selfContained := true
-
-	var (
-		adjustedBuf []byte
-		tempBuf     []byte
-		err         error
-	)
-
-	// Segment a copy of the frame via a local cursor rather than mutating
-	// f.buf as we go, so that an error partway through segmentation leaves
-	// f.buf byte-for-byte intact. f.buf is only replaced once the whole frame
-	// has been segmented successfully.
+	// Segment the frame via a local cursor rather than mutating f.buf as we go,
+	// and only swap the buffers once the whole frame has been segmented
+	// successfully, so that an error partway through leaves f.buf byte-for-byte
+	// intact.
 	src := f.buf
+	wire := f.growWireBuf(segmentedFrameSize(len(src), f.compressor != nil))
+
+	var err error
+	selfContained := true
 
 	// Process the buffer in chunks if it exceeds the max payload size
 	for len(src) > maxSegmentPayloadSize {
-		if f.compressor != nil {
-			tempBuf, err = newCompressedSegment(src[:maxSegmentPayloadSize], false, f.compressor)
-		} else {
-			tempBuf, err = newUncompressedSegment(src[:maxSegmentPayloadSize], false)
-		}
+		wire, err = f.appendSegment(wire, src[:maxSegmentPayloadSize], false)
 		if err != nil {
 			return err
 		}
 
-		adjustedBuf = append(adjustedBuf, tempBuf...)
 		src = src[maxSegmentPayloadSize:]
 		selfContained = false
 	}
 
 	// Process the remaining buffer
-	if f.compressor != nil {
-		tempBuf, err = newCompressedSegment(src, selfContained, f.compressor)
-	} else {
-		tempBuf, err = newUncompressedSegment(src, selfContained)
-	}
-	if err != nil {
+	if wire, err = f.appendSegment(wire, src, selfContained); err != nil {
 		return err
 	}
 
-	adjustedBuf = append(adjustedBuf, tempBuf...)
-	f.buf = adjustedBuf
+	f.wireBuf, f.buf = f.buf, wire
 
 	return nil
+}
+
+// appendSegment encodes payload as one transport segment appended to dst, in the
+// layout matching the framer's compressor.
+func (f *framer) appendSegment(dst, payload []byte, isSelfContained bool) ([]byte, error) {
+	if f.compressor != nil {
+		return appendCompressedSegment(dst, payload, isSelfContained, f.compressor)
+	}
+	return appendUncompressedSegment(dst, payload, isSelfContained)
+}
+
+// growWireBuf returns f.wireBuf emptied and with room for at least n bytes,
+// reallocating only when what it already holds is too small.
+func (f *framer) growWireBuf(n int) []byte {
+	if cap(f.wireBuf) < n {
+		f.wireBuf = make([]byte, 0, n)
+	}
+	return f.wireBuf[:0]
+}
+
+// segmentedFrameSize returns how many bytes a rawLen-byte CQL frame occupies once
+// segmented, so the wire buffer can be sized before anything is encoded into it.
+// For the compressed layout this is an upper bound rather than the exact size:
+// compressed payloads are usually smaller, but a compressor may also return more
+// bytes than it was given, so room for one segment's worth of expansion is added.
+func segmentedFrameSize(rawLen int, compressed bool) int {
+	const (
+		// 3-byte header + CRC24 + payload CRC32.
+		uncompressedSegmentOverhead = 3 + crc24Size + crc32Size
+		// 5-byte header + CRC24 + payload CRC32.
+		compressedSegmentOverhead = 5 + crc24Size + crc32Size
+		// Room for a maximum-size payload growing under compression, matching
+		// lz4's block bound (len + len/255 + 16). A compressor that expands more
+		// than this is still handled correctly, it only makes the wire buffer grow
+		// once.
+		compressionSlack = maxSegmentPayloadSize/255 + 16
+	)
+
+	segments := rawLen/maxSegmentPayloadSize + 1
+	if compressed {
+		return rawLen + segments*compressedSegmentOverhead + compressionSlack
+	}
+	return rawLen + segments*uncompressedSegmentOverhead
 }

@@ -602,24 +602,28 @@ func (m testMockedCompressor) Name() string {
 	return "testMockedCompressor"
 }
 
-func (m testMockedCompressor) AppendCompressed(_, src []byte) ([]byte, error) {
+// AppendCompressed is a no-op "compressor" that still honours the
+// SegmentCompressor contract of appending to dst and returning the extended
+// slice. Returning src alone would let the mock pass while a caller that encodes
+// segments directly into dst (framer.prepareModernLayout) breaks.
+func (m testMockedCompressor) AppendCompressed(dst, src []byte) ([]byte, error) {
 	if m.expectedError != nil {
 		return nil, m.expectedError
 	}
-	return src, nil
+	return append(dst, src...), nil
 }
 
-func (m testMockedCompressor) AppendDecompressed(_, src []byte, decompressedLength uint32) ([]byte, error) {
+func (m testMockedCompressor) AppendDecompressed(dst, src []byte, decompressedLength uint32) ([]byte, error) {
 	if m.expectedError != nil {
 		return nil, m.expectedError
 	}
 
 	// simulating invalid size of decoded data
 	if m.invalidateDecodedDataLength {
-		return src[:decompressedLength-1], nil
+		return append(dst, src[:decompressedLength-1]...), nil
 	}
 
-	return src, nil
+	return append(dst, src...), nil
 }
 
 func (m testMockedCompressor) Encode(data []byte) ([]byte, error) {
@@ -965,5 +969,85 @@ func TestPrepareModernLayoutSuccessUnchanged(t *testing.T) {
 		if !bytes.Equal(f.buf, want) {
 			t.Fatalf("size %d: segmented output changed", size)
 		}
+	}
+}
+
+// expandingCompressor is an incompressible-data compressor that demands capacity
+// exactly the way pierrec/lz4 does: its output may exceed its input by the lz4
+// block bound (len + len/255 + 16), and it grows dst — reallocating and copying
+// everything accumulated so far — whenever dst has less spare capacity than that
+// bound. It is what makes an undersized wire buffer observable as an allocation.
+type expandingCompressor struct{}
+
+func (expandingCompressor) Name() string { return "expanding" }
+
+func (expandingCompressor) AppendCompressed(dst, src []byte) ([]byte, error) {
+	bound := len(src) + len(src)/255 + 16
+	oldLen := len(dst)
+	if cap(dst)-oldLen < bound {
+		grown := make([]byte, oldLen+bound)
+		copy(grown, dst)
+		dst = grown
+	}
+	// Expand slightly, so every segment takes appendCompressedSegment's
+	// "compression was not worth it" fallback back to the raw payload.
+	out := dst[:oldLen+len(src)+len(src)/255+1]
+	copy(out[oldLen:], src)
+	return out, nil
+}
+
+func (expandingCompressor) AppendDecompressed(dst, src []byte, _ uint32) ([]byte, error) {
+	return append(dst, src...), nil
+}
+
+func (expandingCompressor) Encode(data []byte) ([]byte, error) { return data, nil }
+func (expandingCompressor) Decode(data []byte) ([]byte, error) { return data, nil }
+
+// TestPrepareModernLayoutReusesBuffers pins that a framer reused for consecutive
+// v5 requests segments them without allocating: the wire buffer must be kept on
+// the framer and swapped with the raw-frame buffer, not built from scratch (which
+// allocated the whole wire output, plus a temporary per segment, per request).
+//
+// The expanding cases additionally cover a multi-segment compressed frame whose
+// every payload grows under compression, which is what segmentedFrameSize's
+// one-segment slack is for. Expansion does not accumulate across segments: only
+// one segment is ever mid-compression, and a segment whose compressed form came
+// out larger is rewritten as its raw payload before the next one starts. Note
+// that a short estimate would only cost one extra grow rather than a per-request
+// allocation, since both buffers converge on the capacity actually needed — this
+// asserts the steady state, not the constant.
+func TestPrepareModernLayoutReusesBuffers(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		compressor Compressor
+		size       int
+	}{
+		{"single segment", nil, 4096},
+		{"multi segment", nil, 2*maxSegmentPayloadSize + 7},
+		{"compressed", testMockedCompressor{}, 4096},
+		{"expanding compressed, single segment", expandingCompressor{}, maxSegmentPayloadSize - 1},
+		{"expanding compressed, multi segment", expandingCompressor{}, 5*maxSegmentPayloadSize - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{0x5A}, tc.size)
+			f := newFramer(tc.compressor, protoVersion5)
+
+			segment := func() {
+				f.buf = append(f.buf[:0], payload...)
+				if err := f.prepareModernLayout(); err != nil {
+					t.Fatalf("prepareModernLayout: %v", err)
+				}
+			}
+
+			// The first calls legitimately allocate: both buffers still have to
+			// grow to the size of this frame.
+			for i := 0; i < 5; i++ {
+				segment()
+			}
+
+			if allocs := testing.AllocsPerRun(20, segment); allocs != 0 {
+				t.Errorf("segmenting a warmed-up framer allocated %v times per request, want 0", allocs)
+			}
+		})
 	}
 }

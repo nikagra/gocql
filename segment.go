@@ -25,7 +25,6 @@
 package gocql
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -229,56 +228,49 @@ func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, er
 	return payload, h.isSelfContained, nil
 }
 
-func newUncompressedSegment(payload []byte, isSelfContained bool) ([]byte, error) {
-	const (
-		headerSize       = 6
-		selfContainedBit = 1 << 17
-	)
+// appendUncompressedSegment encodes payload as one uncompressed transport segment
+// (header, CRC24, payload, payload CRC32) directly into dst and returns the
+// extended slice. On error the returned slice must not be used: the compressed
+// variant can fail after having written into dst.
+func appendUncompressedSegment(dst, payload []byte, isSelfContained bool) ([]byte, error) {
+	const selfContainedBit = 1 << 17
 
 	payloadLen := len(payload)
 	if payloadLen > maxSegmentPayloadSize {
 		return nil, fmt.Errorf("gocql: payload length (%d) exceeds maximum size of %d", payloadLen, maxSegmentPayloadSize)
 	}
 
-	// Create the segment
-	segmentSize := headerSize + payloadLen + crc32Size
-	segment := make([]byte, segmentSize)
-
-	// First 3 bytes: payload length and self-contained flag
+	// First 3 bytes: payload length and self-contained flag, as a single
+	// little-endian integer.
 	headerInt := uint32(payloadLen)
 	if isSelfContained {
-		headerInt |= selfContainedBit // Set the self-contained flag
+		headerInt |= selfContainedBit
 	}
+	var header [3]byte
+	header[0] = byte(headerInt)
+	header[1] = byte(headerInt >> 8)
+	header[2] = byte(headerInt >> 16)
 
-	// Encode the first 3 bytes as a single little-endian integer
-	segment[0] = byte(headerInt)
-	segment[1] = byte(headerInt >> 8)
-	segment[2] = byte(headerInt >> 16)
+	// The next 3 bytes are the CRC24 of the header.
+	checksum := crc.Crc24(header[:])
+	dst = append(dst, header[0], header[1], header[2],
+		byte(checksum), byte(checksum>>8), byte(checksum>>16))
 
-	// Calculate CRC24 for the first 3 bytes of the header
-	checksum := crc.Crc24(segment[:3])
-
-	// Encode CRC24 into the next 3 bytes of the header
-	segment[3] = byte(checksum)
-	segment[4] = byte(checksum >> 8)
-	segment[5] = byte(checksum >> 16)
-
-	copy(segment[headerSize:], payload) // Copy the payload to the segment
-
-	// Calculate CRC32 for the payload
-	payloadCRC32 := crc.Crc32(payload)
-	binary.LittleEndian.PutUint32(segment[headerSize+payloadLen:], payloadCRC32)
-
-	return segment, nil
+	dst = append(dst, payload...)
+	return binary.LittleEndian.AppendUint32(dst, crc.Crc32(payload)), nil
 }
 
-func newCompressedSegment(uncompressedPayload []byte, isSelfContained bool, compressor Compressor) ([]byte, error) {
+// appendCompressedSegment encodes payload as one compressed transport segment
+// directly into dst and returns the extended slice. The compressed payload is
+// written into dst before its length is known, so the header is reserved first
+// and filled in afterwards. See appendUncompressedSegment for the error contract.
+func appendCompressedSegment(dst, payload []byte, isSelfContained bool, compressor Compressor) ([]byte, error) {
 	const (
 		headerSize       = 5
 		selfContainedBit = 1 << 34
 	)
 
-	uncompressedLen := len(uncompressedPayload)
+	uncompressedLen := len(payload)
 	if uncompressedLen > maxSegmentPayloadSize {
 		return nil, fmt.Errorf("gocql: payload length (%d) exceeds maximum size of %d", uncompressedLen, maxSegmentPayloadSize)
 	}
@@ -287,12 +279,24 @@ func newCompressedSegment(uncompressedPayload []byte, isSelfContained bool, comp
 	if err != nil {
 		return nil, err
 	}
-	compressedPayload, err := segComp.AppendCompressed(nil, uncompressedPayload)
+
+	var reserved [headerSize + crc24Size]byte
+	headerStart := len(dst)
+	dst = append(dst, reserved[:]...)
+	payloadStart := len(dst)
+
+	dst, err = segComp.AppendCompressed(dst, payload)
 	if err != nil {
 		return nil, err
 	}
-
-	compressedLen := len(compressedPayload)
+	// SegmentCompressor requires appending to dst. A custom implementation that
+	// instead returns only its own output would leave the reserved header out of
+	// the returned slice; report that rather than slicing out of range below.
+	if len(dst) < payloadStart {
+		return nil, fmt.Errorf("gocql: compressor %q returned %d bytes, it must append to the %d bytes it was given",
+			compressor.Name(), len(dst), payloadStart)
+	}
+	compressedLen := len(dst) - payloadStart
 
 	// Fall back to sending the payload uncompressed when compression did not
 	// shrink it, or (defensively) if a SegmentCompressor returns an empty result
@@ -305,43 +309,34 @@ func newCompressedSegment(uncompressedPayload []byte, isSelfContained bool, comp
 		// 2.2
 		//  An uncompressed length of 0 signals that the compressed payload
 		//  should be used as-is and not decompressed.
-		compressedPayload = uncompressedPayload
+		dst = append(dst[:payloadStart], payload...)
 		compressedLen = uncompressedLen
 		uncompressedLen = 0
 	}
 
-	// Combine compressed and uncompressed lengths and set the self-contained flag if needed
+	// Combine compressed and uncompressed lengths and set the self-contained flag
+	// if needed. The value occupies 35 bits at most, so the 3 bytes PutUint64
+	// writes past the 5-byte header are zero and are then overwritten by the CRC24.
 	combined := uint64(compressedLen) | uint64(uncompressedLen)<<17
 	if isSelfContained {
 		combined |= selfContainedBit
 	}
+	header := dst[headerStart:payloadStart]
+	binary.LittleEndian.PutUint64(header, combined)
+	headerChecksum := crc.Crc24(header[:headerSize])
+	header[headerSize] = byte(headerChecksum)
+	header[headerSize+1] = byte(headerChecksum >> 8)
+	header[headerSize+2] = byte(headerChecksum >> 16)
 
-	var headerBuf [headerSize + crc24Size]byte
+	return binary.LittleEndian.AppendUint32(dst, crc.Crc32(dst[payloadStart:])), nil
+}
 
-	// Write the combined value into the header buffer
-	binary.LittleEndian.PutUint64(headerBuf[:], combined)
+// newUncompressedSegment returns payload as a standalone uncompressed segment.
+func newUncompressedSegment(payload []byte, isSelfContained bool) ([]byte, error) {
+	return appendUncompressedSegment(nil, payload, isSelfContained)
+}
 
-	// Create a buffer with enough capacity to hold the header, compressed payload, and checksums
-	buf := bytes.NewBuffer(make([]byte, 0, headerSize+crc24Size+compressedLen+crc32Size))
-
-	// Write the first 5 bytes of the header (compressed and uncompressed sizes)
-	buf.Write(headerBuf[:headerSize])
-
-	// Compute and write the CRC24 checksum of the first 5 bytes
-	headerChecksum := crc.Crc24(headerBuf[:headerSize])
-
-	// LittleEndian 3 bytes
-	headerBuf[0] = byte(headerChecksum)
-	headerBuf[1] = byte(headerChecksum >> 8)
-	headerBuf[2] = byte(headerChecksum >> 16)
-	buf.Write(headerBuf[:3])
-
-	buf.Write(compressedPayload)
-
-	// Compute and write the CRC32 checksum of the payload
-	payloadChecksum := crc.Crc32(compressedPayload)
-	binary.LittleEndian.PutUint32(headerBuf[:], payloadChecksum)
-	buf.Write(headerBuf[:4])
-
-	return buf.Bytes(), nil
+// newCompressedSegment returns payload as a standalone compressed segment.
+func newCompressedSegment(payload []byte, isSelfContained bool, compressor Compressor) ([]byte, error) {
+	return appendCompressedSegment(nil, payload, isSelfContained, compressor)
 }
