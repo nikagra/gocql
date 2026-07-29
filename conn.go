@@ -199,14 +199,23 @@ type Conn struct {
 	calls map[int]*callReq
 	// segScratch holds the reusable buffers inbound v5 segments are read into.
 	// Only touched by the receive path, which runs on the serve() goroutine.
-	segScratch           segmentScratch
-	r                    ConnReader
-	session              *Session
-	framers              connFramers
-	cancel               context.CancelFunc
+	segScratch segmentScratch
+	r          ConnReader
+	session    *Session
+	framers    connFramers
+	cancel     context.CancelFunc
+	// currentKeyspace is the keyspace this connection was switched to by
+	// Conn.UseKeyspace, and the default the prepared-statement cache is keyed by
+	// (see executeQuery/executeBatch). It deliberately tracks only driver-issued
+	// USE: a `USE` statement a caller executes as an ordinary query switches the
+	// server side of whichever single pooled connection it landed on, and the
+	// driver does not follow it — so cache keys keep using the configured keyspace.
+	//
+	// Atomic because UseKeyspace is exported: a caller invoking it on a live
+	// connection would otherwise race the request goroutines reading it.
+	currentKeyspace      atomic.Pointer[string]
 	addr                 string
 	usingTimeoutClause   string
-	currentKeyspace      string
 	cqlProtoExts         []cqlProtocolExtension
 	scyllaSupported      ScyllaConnectionFeatures
 	systemRequestTimeout time.Duration
@@ -2032,7 +2041,7 @@ func (c *Conn) executeQueryWithMetrics(ctx context.Context, qry *Query, metrics 
 
 	// If a keyspace for the qry is overriden,
 	// then we should use it to create stmt cache key
-	usedKeyspace := c.currentKeyspace
+	usedKeyspace := c.getCurrentKeyspace()
 	if qry.keyspace != "" {
 		usedKeyspace = qry.keyspace
 	}
@@ -2304,9 +2313,24 @@ func (c *Conn) UseKeyspace(keyspace string) error {
 		return NewErrProtocol("unknown frame in response to USE: %v", x)
 	}
 
-	c.currentKeyspace = keyspace
+	c.setCurrentKeyspace(keyspace)
 
 	return nil
+}
+
+// setCurrentKeyspace records the keyspace this connection was switched to. See the
+// currentKeyspace field for why it is atomic.
+func (c *Conn) setCurrentKeyspace(keyspace string) {
+	c.currentKeyspace.Store(&keyspace)
+}
+
+// getCurrentKeyspace returns the keyspace this connection was switched to, or ""
+// if it was never switched (Cluster.Keyspace empty, or a control connection).
+func (c *Conn) getCurrentKeyspace() string {
+	if ks := c.currentKeyspace.Load(); ks != nil {
+		return *ks
+	}
+	return ""
 }
 
 func (c *Conn) executeBatch(ctx context.Context, batch *Batch) (iter *Iter) {
@@ -2327,7 +2351,7 @@ func (c *Conn) executeBatch(ctx context.Context, batch *Batch) (iter *Iter) {
 	req.keyspace = batch.keyspace
 	req.nowInSeconds = batch.nowInSeconds
 
-	usedKeyspace := c.currentKeyspace
+	usedKeyspace := c.getCurrentKeyspace()
 	if batch.keyspace != "" {
 		usedKeyspace = batch.keyspace
 	}
