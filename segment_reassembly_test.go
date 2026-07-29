@@ -214,3 +214,82 @@ func TestRecvSplitFrameRejectsTruncatedHeaderStream(t *testing.T) {
 		t.Fatalf("expected read failure after truncation, got %v", err)
 	}
 }
+
+// v5ReadyFrame builds a v5 READY response frame on the event stream, declaring
+// bodyLen body bytes but carrying only the bytes in body. With no session
+// attached, processFrameSource parses such a frame and drops it, which is all
+// these tests need from a well-formed one.
+func v5ReadyFrame(bodyLen int, body []byte) []byte {
+	frame := make([]byte, headSize)
+	frame[0] = protoVersion5 | protoDirectionMask
+	binary.BigEndian.PutUint16(frame[2:4], uint16(0xFFFF))
+	frame[4] = byte(frm.OpReady)
+	binary.BigEndian.PutUint32(frame[5:headSize], uint32(bodyLen))
+	return append(frame, body...)
+}
+
+// TestProcessAllFramesInSegmentBoundsFrameLength pins that a frame header inside
+// a self-contained segment cannot declare a body the segment does not carry.
+//
+// A self-contained segment holds only whole frames, so such a header is a
+// framing violation — but readFrame acts on the declared length before it
+// discovers the short read, and the io.ErrUnexpectedEOF that follows is not a
+// net.Error, so processFrameSource would keep it per-request and leave the
+// connection up for the peer to do it again. A ~20-byte segment would buy a
+// maxFrameSize allocation, repeatable.
+func TestProcessAllFramesInSegmentBoundsFrameLength(t *testing.T) {
+	newConn := func(stream []byte) *Conn {
+		c := &Conn{
+			r:       newSegmentReader(stream),
+			streams: streams.New(),
+			logger:  &defaultLogger{},
+		}
+		c.initFramerCache()
+		return c
+	}
+
+	// Well below maxFrameSize, but far enough above the segment that the budget
+	// below cannot be met by accident if the bound is removed.
+	const declared = 32 << 20
+
+	t.Run("rejects a header longer than the whole segment", func(t *testing.T) {
+		seg := mustUncompressedSegment(t, v5ReadyFrame(declared, nil), true)
+		c := newConn(seg)
+
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		err := c.recvSegment(context.Background())
+		runtime.ReadMemStats(&after)
+
+		if err == nil || !strings.Contains(err.Error(), "remain in the self-contained segment") {
+			t.Fatalf("expected the declared length to be bounded by the segment, got %v", err)
+		}
+		// The error alone does not prove much: the unbounded path reaches the same
+		// failure, just after allocating what the peer asked for.
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > declared/8 {
+			t.Errorf("rejecting the frame allocated %d bytes, want well under the %d it declared", allocated, declared)
+		}
+	})
+
+	t.Run("bounds each frame by what is left, not by the segment", func(t *testing.T) {
+		// A complete frame first, so the second header is checked against the
+		// remainder rather than the segment's original length.
+		payload := v5ReadyFrame(0, nil)
+		payload = append(payload, v5ReadyFrame(declared, nil)...)
+		c := newConn(mustUncompressedSegment(t, payload, true))
+
+		err := c.recvSegment(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "remain in the self-contained segment") {
+			t.Fatalf("expected the second frame to be bounded by the remaining bytes, got %v", err)
+		}
+	})
+
+	t.Run("accepts a frame that exactly fills the segment", func(t *testing.T) {
+		body := bytes.Repeat([]byte{0x5A}, 64)
+		c := newConn(mustUncompressedSegment(t, v5ReadyFrame(len(body), body), true))
+
+		if err := c.recvSegment(context.Background()); err != nil {
+			t.Fatalf("a frame whose body ends exactly at the segment boundary must be accepted, got %v", err)
+		}
+	})
+}

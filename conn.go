@@ -879,6 +879,22 @@ func (c *Conn) recv(ctx context.Context, startupCompleted bool) error {
 type frameSource struct {
 	r    io.Reader
 	body []byte
+	// segment, when non-nil, is the self-contained v5 segment payload r reads
+	// from. Such a segment carries only whole frames, so a header declaring a body
+	// longer than what is left in the segment is a framing violation, and
+	// processFrameSource rejects it before readFrame acts on the declared length.
+	//
+	// That check is what keeps the length honest here. Off the socket, a lying
+	// header costs the peer the bytes it claimed or stalls into a net.Error that
+	// takes the connection down; out of a segment the short read is immediate and
+	// yields io.ErrUnexpectedEOF, which is not a net.Error, so processFrameSource
+	// keeps it per-request and leaves the connection up. A ~20-byte segment could
+	// otherwise buy a maxFrameSize allocation, repeatable for as long as the peer
+	// cares to send them.
+	//
+	// Nil on the pre-v5 socket path, and nil for a reassembled frame, where
+	// framer.adoptFrameBody already matches the declared length exactly.
+	segment *bytes.Reader
 }
 
 // readBody fills f with the frame body described by head, either by reading it
@@ -944,6 +960,15 @@ func (c *Conn) processFrameSource(ctx context.Context, src frameSource) error {
 			End:     headEndTime,
 			Host:    c.host,
 		})
+	}
+
+	// Fatal, like the stream bound below, and for the same reason: the segment
+	// payload's CRC32 already verified, so this is not corruption in flight but a
+	// peer whose framing does not describe the bytes it sent. Nothing later on this
+	// connection can be trusted to start where we think it does. Making it
+	// per-request instead is what would let the peer repeat it — see frameSource.
+	if src.segment != nil && head.Length > src.segment.Len() {
+		return fmt.Errorf("gocql: frame header declares a %d byte body but only %d bytes remain in the self-contained segment", head.Length, src.segment.Len())
 	}
 
 	if head.Stream > c.streams.NumStreams {
@@ -1225,15 +1250,19 @@ func (c *Conn) readContinuationSegment() ([]byte, error) {
 func (c *Conn) processAllFramesInSegment(ctx context.Context, r *bytes.Reader) error {
 	// A self-contained segment carries one or more complete CQL frames, so we
 	// drain them all. This is safe to iterate: the segment payload has already
-	// been CRC32-verified, and processFrame consumes exactly one frame (header +
-	// body) per call, keeping r aligned for the next iteration. processFrame
+	// been CRC32-verified, and processFrameSource consumes exactly one frame
+	// (header + body) per call, keeping r aligned for the next iteration. It
 	// returns a non-nil error only for connection-fatal conditions (which stops
 	// the loop); a per-request decode error is delivered to that request's
-	// waiting caller and processFrame returns nil, so sibling frames in the same
-	// segment are still processed.
+	// waiting caller and it returns nil, so sibling frames in the same segment are
+	// still processed.
+	//
+	// r is passed as the segment as well as the reader, which is what bounds each
+	// frame's declared body length by the bytes actually left in the segment (see
+	// frameSource).
 	var err error
 	for r.Len() > 0 && err == nil {
-		err = c.processFrame(ctx, r)
+		err = c.processFrameSource(ctx, frameSource{r: r, segment: r})
 	}
 
 	return err
