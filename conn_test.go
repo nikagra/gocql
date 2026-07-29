@@ -2933,6 +2933,93 @@ func TestConnReadDelegatesToConnReader(t *testing.T) {
 	require.Equal(t, payload, buf)
 }
 
+// scriptedReadSource is a ConnReader whose reads come from a script of
+// (bytes, error) steps. It lets tests drive partial reads and timing-out reads
+// without a socket, and it can be installed as Conn.r.
+type scriptedReadSource struct {
+	steps []scriptedRead
+	step  int
+}
+
+type scriptedRead struct {
+	data []byte
+	err  error
+}
+
+func (s *scriptedReadSource) Read(p []byte) (int, error) {
+	if s.step >= len(s.steps) {
+		return 0, io.EOF
+	}
+	step := s.steps[s.step]
+	s.step++
+	n := copy(p, step.data)
+	return n, step.err
+}
+
+func (s *scriptedReadSource) Close() error               { return nil }
+func (s *scriptedReadSource) RemoteAddr() net.Addr       { return nil }
+func (s *scriptedReadSource) SetTimeout(_ time.Duration) {}
+func (s *scriptedReadSource) GetTimeout() time.Duration  { return 0 }
+
+// timeoutErr is a net.Error reporting a timeout, standing in for the
+// os.ErrDeadlineExceeded a real socket returns once its read deadline expires.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+var _ net.Error = timeoutErr{}
+
+// TestProcessFrameDesyncedBodyIsFatalAndWakesCaller pins the two halves of what
+// has to happen when a frame body cannot be read off the wire:
+//
+//   - processFrame returns the error, so serve() closes the connection. The
+//     unread remainder of the body is still queued on the socket, so reusing the
+//     connection would read it as the next frame header and mis-frame everything
+//     after it.
+//   - the waiting caller is handed the error first. head.Stream has already been
+//     removed from c.calls by this point, so closeWithError can no longer find the
+//     call: returning without delivering would leave exec() waiting out its full
+//     request timeout for a response that can never arrive.
+func TestProcessFrameDesyncedBodyIsFatalAndWakesCaller(t *testing.T) {
+	t.Parallel()
+
+	header := []byte{
+		protoVersion4 | protoDirectionMask, 0x00, 0x00, 0x01, byte(frm.OpResult),
+		0x00, 0x00, 0x00, 0x08, // body length 8
+	}
+
+	// The peer sends a complete header and then stalls partway through the body.
+	r := &scriptedReadSource{steps: []scriptedRead{
+		{data: header},
+		{data: []byte{0x01, 0x02, 0x03}, err: timeoutErr{}},
+	}}
+
+	// Buffered so the delivery does not need a second goroutine.
+	call := &callReq{timeout: make(chan struct{}), streamID: 1, resp: make(chan callResp, 1)}
+	c := &Conn{
+		r:       r,
+		calls:   map[int]*callReq{1: call},
+		version: protoVersion4,
+		streams: streams.New(),
+		logger:  nopLogger{},
+	}
+
+	err := c.processFrame(context.Background(), c.r)
+
+	require.Error(t, err, "a half-read body desyncs the connection and must be fatal")
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+
+	select {
+	case resp := <-call.resp:
+		require.ErrorIs(t, resp.err, err, "the waiting caller must be handed the same failure")
+	default:
+		t.Fatal("the call was never woken: it would wait out its full request timeout")
+	}
+}
+
 // TestRecvSegmentReassemblesFrameWithSplitHeader verifies that recvSegment
 // correctly reassembles a single CQL frame that is split across multiple
 // non-self-contained segments even when the 9-byte CQL frame header itself

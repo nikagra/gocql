@@ -30,7 +30,9 @@ package gocql
 import (
 	"bytes"
 	"errors"
+	"io"
 	"math"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -142,6 +144,87 @@ func TestFrameReadTooLong(t *testing.T) {
 		t.Fatalf("expected to get header %v got %v", frm.OpReady, head.Op)
 	}
 }
+
+// TestReadFrameBodyErrorKeepsNetError pins that a failed body read stays
+// recognisable as a net.Error through readFrame's wrapping. Conn.processFrameSource
+// decides whether the connection is desynced (and must be closed) from exactly this
+// check; formatting the cause with %v instead of %w silently defeats it, and the
+// half-read body is then read back as the next frame header.
+func TestReadFrameBodyErrorKeepsNetError(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		r    io.Reader
+		want bool
+	}{
+		{
+			name: "timeout mid-body",
+			r:    io.MultiReader(bytes.NewReader([]byte{0x01, 0x02}), errReader{timeoutErr{}}),
+			want: true,
+		},
+		{
+			// A peer that closes mid-body is equally desyncing, but io.ErrUnexpectedEOF
+			// is not a net.Error; the connection dies on the next read instead.
+			name: "peer closed mid-body",
+			r:    bytes.NewReader([]byte{0x01, 0x02}),
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFramer(nil, protoVersion4)
+			head := frm.FrameHeader{Version: protoVersion4 | protoDirectionMask, Op: frm.OpReady, Length: 8}
+
+			err := f.readFrame(tc.r, &head)
+			require.Error(t, err)
+
+			var netErr net.Error
+			require.Equal(t, tc.want, errors.As(err, &netErr),
+				"errors.As(net.Error) on %q", err)
+		})
+	}
+}
+
+// TestReadFrameDiscardErrorKeepsNetError is the same pin for the oversized-frame
+// path: an over-long frame is normally recovered from by discarding its body, but
+// if the discard itself fails the remainder is still on the wire.
+func TestReadFrameDiscardErrorKeepsNetError(t *testing.T) {
+	t.Parallel()
+
+	f := newFramer(nil, protoVersion4)
+	head := frm.FrameHeader{Version: protoVersion4 | protoDirectionMask, Op: frm.OpReady, Length: maxFrameSize + 1}
+
+	err := f.readFrame(errReader{timeoutErr{}}, &head)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrFrameTooBig, "the discard failed, so the frame was not skipped")
+
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr), "errors.As(net.Error) on %q", err)
+}
+
+// TestReadHeaderRejectsNegativeLength pins that a length field with the high bit
+// set is rejected by readHeader. The field is signed on the wire, so such a value
+// arrives negative; readFrame also rejects it, but only an error out of readHeader
+// closes the connection, and a header this broken means the stream position can no
+// longer be trusted.
+func TestReadHeaderRejectsNegativeLength(t *testing.T) {
+	t.Parallel()
+
+	header := []byte{
+		protoVersion4 | protoDirectionMask, 0x00, 0x00, 0x01, byte(frm.OpResult),
+		0xFF, 0xFF, 0xFF, 0xFF, // length = -1
+	}
+
+	_, err := readHeader(bytes.NewReader(header), make([]byte, headSize))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid frame body length")
+}
+
+// errReader fails every read with err, standing in for a socket whose read
+// deadline expired or which was reset.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
 func TestParseResultMetadata_PerColumnSpec(t *testing.T) {
 	t.Parallel()

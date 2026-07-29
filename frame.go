@@ -465,6 +465,15 @@ func readHeader(r io.Reader, p []byte) (head frm.FrameHeader, err error) {
 	head.Op = frm.Op(p[4])
 	head.Length = int(readInt(p[5:]))
 
+	// The length is a signed 32-bit field on the wire, so any value with the high
+	// bit set arrives negative. Reject it here rather than further down in
+	// readFrame: a header this broken means the stream position is no longer
+	// trustworthy, and only an error out of readHeader closes the connection —
+	// readFrame's error is handed to the waiting caller while serve() reads on.
+	if head.Length < 0 {
+		return frm.FrameHeader{}, fmt.Errorf("gocql: invalid frame body length: %d", head.Length)
+	}
+
 	return head, nil
 }
 
@@ -480,13 +489,21 @@ func (f *framer) payload() {
 
 // reads a frame form the wire into the framers buffer
 func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
+	// A negative length is rejected by readHeader, which is where it has to be
+	// caught: there the error is fatal to the connection, whereas an error from
+	// here is delivered to the waiting caller. Kept as a precondition check for
+	// callers that synthesise a header.
 	if head.Length < 0 {
 		return fmt.Errorf("frame body length can not be less than 0: %d", head.Length)
 	} else if head.Length > maxFrameSize {
 		// need to free up the connection to be used again
 		_, err := io.CopyN(io.Discard, r, int64(head.Length))
 		if err != nil {
-			return fmt.Errorf("error whilst trying to discard frame with invalid length: %v", err)
+			// %w, not %v: a failed discard leaves the undiscarded remainder of the
+			// body on the wire, so the caller has to be able to recognise a network
+			// error here and close the connection rather than read the leftover
+			// bytes as the next frame header.
+			return fmt.Errorf("error whilst trying to discard frame with invalid length: %w", err)
 		}
 		return ErrFrameTooBig
 	}
@@ -498,10 +515,13 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 		f.buf = f.readBuffer
 	}
 
-	// assume the underlying reader takes care of timeouts and retries
 	n, err := io.ReadFull(r, f.buf)
 	if err != nil {
-		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %v", n, head.Length, err)
+		// %w, not %v: a partially read body leaves the rest of it on the wire, so
+		// the connection is desynced and must be closed. Conn.processFrame decides
+		// that with errors.As, which a %v-formatted error would defeat — the
+		// connection would be reused and every later frame mis-framed.
+		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.Length, err)
 	}
 
 	if f.proto < protoVersion5 && head.Flags&frm.FlagCompress == frm.FlagCompress {

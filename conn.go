@@ -962,15 +962,26 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	framer := c.getReadFramer()
 
 	err = framer.readFrame(r, &head)
-	if err != nil {
-		// only net errors should cause the connection to be closed. Though
-		// cassandra returning corrupt frames will be returned here as well.
-		if _, ok := err.(net.Error); ok {
-			c.releaseReadFramer(framer)
-			return err
-		}
-	}
 
+	// Only a network error means the stream itself is broken: the body was read
+	// partially (or not at all), so the rest of it is still on the wire and every
+	// subsequent read would be mis-framed. The connection has to go. A decode
+	// failure, or an over-long frame whose body was successfully discarded, leaves
+	// the stream aligned and stays a per-request error.
+	//
+	// errors.As rather than a type assertion: readFrame wraps the read error, so an
+	// assertion on the wrapper never matches (which is precisely how this used to
+	// leave desynced connections in the pool).
+	var netErr net.Error
+	desynced := err != nil && errors.As(err, &netErr)
+
+	// Deliver the outcome before returning it, even when fatal. head.Stream was
+	// already removed from c.calls above, so closeWithError's drain loop can no
+	// longer find this call: returning early would leave the caller waiting out its
+	// full request timeout for a response that can never arrive, and would leak the
+	// callReq. Delivering first makes it fail immediately, and the framer/stream
+	// accounting stays on the paths that already handle it.
+	//
 	// we either, return a response to the caller, the caller timedout, or the
 	// connection has closed. Either way we should never block indefinatly here
 	select {
@@ -980,6 +991,10 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		c.abandonRecvCall(call, framer)
 	case <-ctx.Done():
 		c.abandonRecvCall(call, framer)
+	}
+
+	if desynced {
+		return err
 	}
 
 	return nil
