@@ -1101,17 +1101,7 @@ func (c *Conn) processFrameSource(ctx context.Context, src frameSource) error {
 
 	err = src.readBody(framer, &head)
 
-	// Only a network error means the stream itself is broken: the body was read
-	// partially (or not at all), so the rest of it is still on the wire and every
-	// subsequent read would be mis-framed. The connection has to go. A decode
-	// failure, or an over-long frame whose body was successfully discarded, leaves
-	// the stream aligned and stays a per-request error.
-	//
-	// errors.As rather than a type assertion: readFrame wraps the read error, so an
-	// assertion on the wrapper never matches (which is precisely how this used to
-	// leave desynced connections in the pool).
-	var netErr net.Error
-	desynced := err != nil && errors.As(err, &netErr)
+	desynced := bodyReadDesyncedConn(err)
 
 	// Deliver the outcome before returning it, even when fatal. head.Stream was
 	// already removed from c.calls above, so closeWithError's drain loop can no
@@ -1136,6 +1126,37 @@ func (c *Conn) processFrameSource(ctx context.Context, src frameSource) error {
 	}
 
 	return nil
+}
+
+// bodyReadDesyncedConn reports whether a frame-body read failure left the
+// connection at an unknown stream offset, in which case it is fatal: the
+// unconsumed remainder of the body is still on the wire and every subsequent read
+// would be mis-framed. A decode failure, or an over-long frame whose body was
+// successfully discarded, leaves the stream aligned and stays a per-request error.
+//
+// Two kinds of failure qualify.
+//
+// A network error means the body was read partially or not at all. errors.As
+// rather than a type assertion: readFrame wraps the read error, so an assertion on
+// the wrapper never matches (which is precisely how this used to leave desynced
+// connections in the pool).
+//
+// A failed read deadline arm means connReader.Read never reached the socket, so
+// the whole body is still queued on a connection that is otherwise healthy — the
+// worst case, because nothing else will surface the problem and serve() reads the
+// body as its next frame header. It needs naming rather than being left to the
+// net.Error test: net.Conn.SetReadDeadline is only conventionally a *net.OpError,
+// and a connection from a user-supplied Dialer or HostDialer may return a plain
+// error, which would classify this as per-request.
+func bodyReadDesyncedConn(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errArmReadDeadline) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func (c *Conn) readFrameIntoFramer(src frameSource, head frm.FrameHeader) (*framer, error) {
@@ -1497,6 +1518,14 @@ var _ connReadSource = (*connReader)(nil)
 // read that timed out while still making progress. See Read.
 const maxReadAttempts = 5
 
+// errArmReadDeadline marks a read that failed before it reached the socket,
+// because the read deadline could not be armed. Nothing was consumed, which makes
+// it fatal to a frame body read: the body is still queued on a connection that is
+// otherwise healthy (see bodyReadDesyncedConn). It is a named error rather than a
+// bare wrap because that classification cannot be inferred from the underlying
+// error, which need not be a net.Error.
+var errArmReadDeadline = errors.New("gocql: unable to arm the read deadline")
+
 // Read fills p, resuming across read-deadline expiries for as long as the peer
 // keeps delivering bytes.
 //
@@ -1518,7 +1547,10 @@ const maxReadAttempts = 5
 func (c *connReader) Read(p []byte) (n int, err error) {
 	for attempt := 0; attempt < maxReadAttempts; attempt++ {
 		if aerr := c.armDeadline(); aerr != nil {
-			return n, aerr
+			// Wrapped so a caller can tell this from a read that reached the socket:
+			// nothing was consumed here, so a frame body read that hits it leaves the
+			// whole body queued. Double %w keeps the underlying error inspectable.
+			return n, fmt.Errorf("%w: %w", errArmReadDeadline, aerr)
 		}
 
 		nn, rerr := io.ReadFull(c.r, p[n:])

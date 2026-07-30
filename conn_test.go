@@ -2940,6 +2940,12 @@ func TestConnReaderReadReturnsDeadlineError(t *testing.T) {
 			require.Zero(t, n)
 			require.Zero(t, mock.reads,
 				"Read must not touch the connection once arming the deadline failed")
+			// Marked as well as reported: the underlying error need not be a
+			// net.Error, so "nothing was consumed" has to be recoverable by name for
+			// bodyReadDesyncedConn to classify a body read that hits this as fatal.
+			require.ErrorIs(t, err, errArmReadDeadline)
+			require.True(t, bodyReadDesyncedConn(err),
+				"a body read that never reached the socket leaves the whole body queued")
 		})
 	}
 }
@@ -3252,6 +3258,144 @@ func TestProcessFrameDesyncedBodyIsFatalAndWakesCaller(t *testing.T) {
 		require.ErrorIs(t, resp.err, err, "the waiting caller must be handed the same failure")
 	default:
 		t.Fatal("the call was never woken: it would wait out its full request timeout")
+	}
+}
+
+// armFailingConn serves a fixed byte stream and fails SetReadDeadline from
+// failFromArm onwards, with a plain error that is deliberately not a net.Error —
+// net.Conn.SetReadDeadline is only conventionally a *net.OpError, and a connection
+// from a user-supplied Dialer or HostDialer need not follow that.
+type armFailingConn struct {
+	data        []byte
+	off         int
+	failFromArm int
+	err         error
+	arms        int
+}
+
+var _ net.Conn = (*armFailingConn)(nil)
+
+func (c *armFailingConn) SetReadDeadline(time.Time) error {
+	c.arms++
+	if c.arms >= c.failFromArm {
+		return c.err
+	}
+	return nil
+}
+
+func (c *armFailingConn) Read(p []byte) (int, error) {
+	if c.off >= len(c.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data[c.off:])
+	c.off += n
+	return n, nil
+}
+
+func (c *armFailingConn) Write(p []byte) (int, error)      { return 0, io.ErrClosedPipe }
+func (c *armFailingConn) Close() error                     { return nil }
+func (c *armFailingConn) LocalAddr() net.Addr              { return nil }
+func (c *armFailingConn) RemoteAddr() net.Addr             { return nil }
+func (c *armFailingConn) SetDeadline(time.Time) error      { return nil }
+func (c *armFailingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestProcessFrameFailedDeadlineArmIsFatal pins that a body read which never
+// reached the socket is fatal to the connection, and that widening the rule that
+// far did not make every read failure fatal.
+//
+// A failed read-deadline arm is the worst case of a desynced body: connReader.Read
+// returns before touching the socket, so the entire body is still queued on a
+// connection that is otherwise healthy, and serve() reads it as the next frame
+// header. Nothing else surfaces it. Classifying it needs the error to say so —
+// SetReadDeadline's error need not be a net.Error, so the net.Error test alone let
+// this through as a per-request failure and kept the connection in the pool.
+//
+// The second case is the boundary: a short read out of a buffer that has already
+// arrived yields io.ErrUnexpectedEOF, which is not a net.Error either, and must
+// stay per-request. The stream is not desynced — there is no socket behind it — so
+// the connection survives and only the one request fails.
+func TestProcessFrameFailedDeadlineArmIsFatal(t *testing.T) {
+	t.Parallel()
+
+	header := []byte{
+		protoVersion4 | protoDirectionMask, 0x00, 0x00, 0x01, byte(frm.OpResult),
+		0x00, 0x00, 0x00, 0x08, // body length 8
+	}
+	armErr := errors.New("set read deadline failed")
+
+	for _, tc := range []struct {
+		name      string
+		source    func() (frameSource, func())
+		wantFatal bool
+	}{
+		{
+			name: "failed deadline arm",
+			source: func() (frameSource, func()) {
+				// Two arms read the header — one for its first byte with the deadline
+				// disarmed, one for the rest (headerReader) — so the third is the body's.
+				// If that arithmetic ever changes, the header read fails instead and the
+				// "caller was woken" assertion below catches it rather than the test
+				// passing for the wrong reason.
+				mock := &armFailingConn{data: header, failFromArm: 3, err: armErr}
+				cr := &connReader{conn: mock, r: bufio.NewReader(mock)}
+				cr.SetTimeout(5 * time.Second)
+				return frameSource{r: cr}, func() {
+					require.Equal(t, len(header), mock.off,
+						"the whole header must have been read before the body arm failed")
+				}
+			},
+			wantFatal: true,
+		},
+		{
+			name: "short read from an arrived buffer",
+			source: func() (frameSource, func()) {
+				// A header promising 8 body bytes over a buffer holding 3.
+				buf := append(append([]byte(nil), header...), 0x01, 0x02, 0x03)
+				return frameSource{r: bytes.NewReader(buf)}, func() {}
+			},
+			wantFatal: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src, checkSource := tc.source()
+
+			// Buffered so the delivery does not need a second goroutine.
+			call := &callReq{timeout: make(chan struct{}), streamID: 1, resp: make(chan callResp, 1)}
+			c := &Conn{
+				calls:   map[int]*callReq{1: call},
+				version: protoVersion4,
+				streams: streams.New(),
+				logger:  nopLogger{},
+			}
+
+			err := c.processFrameSource(context.Background(), src)
+			checkSource()
+
+			// The caller is always woken, fatal or not: head.Stream has already been
+			// removed from c.calls, so closeWithError can no longer find the call.
+			var delivered error
+			select {
+			case resp := <-call.resp:
+				delivered = resp.err
+			default:
+				t.Fatal("the call was never woken: it would wait out its full request timeout")
+			}
+			require.Error(t, delivered)
+
+			if tc.wantFatal {
+				require.ErrorIs(t, err, errArmReadDeadline,
+					"an unread body on a live connection must close it")
+				require.ErrorIs(t, err, armErr, "the underlying failure must stay inspectable")
+				require.ErrorIs(t, delivered, err, "the waiting caller must be handed the same failure")
+				return
+			}
+
+			require.NoError(t, err,
+				"a short read out of an arrived buffer leaves no unread bytes on a socket, so the connection survives")
+			require.ErrorIs(t, delivered, io.ErrUnexpectedEOF)
+		})
 	}
 }
 

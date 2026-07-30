@@ -457,9 +457,9 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 		_, err := io.CopyN(io.Discard, r, int64(head.Length))
 		if err != nil {
 			// %w, not %v: a failed discard leaves the undiscarded remainder of the
-			// body on the wire, so the caller has to be able to recognise a network
-			// error here and close the connection rather than read the leftover
-			// bytes as the next frame header.
+			// body on the wire, so the caller has to be able to recognise the read
+			// failure here (Conn.bodyReadDesyncedConn) and close the connection rather
+			// than read the leftover bytes as the next frame header.
 			return fmt.Errorf("error whilst trying to discard frame with invalid length: %w", err)
 		}
 		return ErrFrameTooBig
@@ -475,9 +475,10 @@ func (f *framer) readFrame(r io.Reader, head *frm.FrameHeader) error {
 	n, err := io.ReadFull(r, f.buf)
 	if err != nil {
 		// %w, not %v: a partially read body leaves the rest of it on the wire, so
-		// the connection is desynced and must be closed. Conn.processFrameSource
-		// decides that with errors.As, which a %v-formatted error would defeat —
-		// the connection would be reused and every later frame mis-framed.
+		// the connection is desynced and must be closed. Conn.bodyReadDesyncedConn
+		// decides that by inspecting the wrapped error, which a %v-formatted error
+		// would defeat — the connection would be reused and every later frame
+		// mis-framed.
 		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.Length, err)
 	}
 
