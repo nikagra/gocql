@@ -3546,23 +3546,34 @@ func TestRecvSegmentReassemblesFrameWithSplitHeader(t *testing.T) {
 	seg2, err := newUncompressedSegment(full[splitAt:], false)
 	require.NoError(t, err)
 
+	// The helper goroutines only ferry results out; every assertion runs on the
+	// test goroutine. A require failing inside a helper exits that goroutine via
+	// runtime.Goexit, which here would starve recvSegment of its response
+	// delivery and park the test until the suite timeout — and an assertion in
+	// the response goroutine is not synchronised with test completion, so it
+	// could be skipped outright when the test finishes first.
+	writeErr := make(chan error, 1)
 	go func() {
 		buf := append(append([]byte(nil), seg1...), seg2...)
 		_, err := client.Write(buf)
-		require.NoError(t, err)
+		writeErr <- err
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	// A generous margin rather than something tight, so this does not flake
+	// under -race on a loaded CI runner (see TestRecvSegmentPayloadReadIsBounded),
+	// while still failing this test rather than the whole suite on a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.recvSegment(ctx) }()
 
+	respBuf := make(chan []byte, 1)
 	go func() {
 		resp := <-call1.resp
 		close(call1.timeout)
 		// resp.framer.buf holds the frame body (the header is already parsed).
-		require.Equal(t, full[9:], resp.framer.buf)
+		respBuf <- resp.framer.buf
 	}()
 
 	select {
@@ -3571,6 +3582,11 @@ func TestRecvSegmentReassemblesFrameWithSplitHeader(t *testing.T) {
 	case err := <-errCh:
 		require.NoError(t, err)
 	}
+
+	// Delivery to call1.resp happens-before recvSegment returns, so neither
+	// receive can block for long once errCh has fired.
+	require.NoError(t, <-writeErr, "writing the segmented stream")
+	require.Equal(t, full[9:], <-respBuf)
 }
 
 // TestRecvSegmentPayloadReadIsBounded verifies that after the (idle-disarmed)
