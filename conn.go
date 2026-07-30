@@ -926,12 +926,13 @@ func (c *Conn) recv(ctx context.Context, startupCompleted bool) error {
 
 // frameSource supplies one CQL frame to processFrame. The header always comes
 // from r — the socket, or a buffer holding an already-received segment payload.
-// body is set only when the whole frame body is already in memory and the buffer
-// holding it can be given away: the read framer then adopts it instead of reading
-// and copying the body a second time (see framer.adoptFrameBody).
+//
+// Field order is dictated by govet's fieldalignment rather than by how the fields
+// relate: body's length and capacity are the only trailing words here that hold no
+// pointer, so it goes last to keep the pointer-scanned prefix short. It belongs
+// with r.
 type frameSource struct {
-	r    io.Reader
-	body []byte
+	r io.Reader
 	// segment, when non-nil, is the self-contained v5 segment payload r reads
 	// from. Such a segment carries only whole frames, so a header declaring a body
 	// longer than what is left in the segment is a framing violation, and
@@ -957,6 +958,10 @@ type frameSource struct {
 	// Zero means "not measured", which is the pre-v5 socket path: there
 	// processFrameSource reads the header off the wire and times it directly.
 	netStart, netEnd time.Time
+	// body is set only when the whole frame body is already in memory and the
+	// buffer holding it can be given away: the read framer then adopts it instead
+	// of reading and copying the body a second time (see framer.adoptFrameBody).
+	body []byte
 }
 
 // readBody fills f with the frame body described by head, either by reading it
