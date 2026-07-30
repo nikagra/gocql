@@ -39,6 +39,7 @@ It also provides support for shard aware ports, a faster way to connect to all s
   - [5.1 Shard-aware port](#51-shard-aware-port)
   - [5.2 Client routes (PrivateLink)](#52-client-routes-privatelink)
   - [5.3 Iterator](#53-iterator)
+  - [5.4 Compression](#54-compression)
 - [6. Contributing](#6-contributing)
 
 ## 1. Sunsetting Model
@@ -264,7 +265,7 @@ In case of range and `ALLOW FILTERING` queries server can send empty responses f
 That is why you should never consider empty response as the end of the result set.
 Always check `iter.Scan()` result to know if there are more results, or `Iter.LastPage()` to know if the last page was reached.
 
-### 5.3 Compression
+### 5.4 Compression
 
 To control network costs and traffic, you can enable compression.
 
