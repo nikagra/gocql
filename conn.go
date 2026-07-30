@@ -1355,6 +1355,16 @@ func (c *Conn) readFirstSegmentHeader() (segmentHeader, error) {
 // valid 256 MiB response. Ownership of the buffer is then handed to the read
 // framer rather than copied into it, so the frame is never resident twice.
 //
+// The declared length itself is the peer's to choose, up to maxFrameSize, so a
+// small hostile prologue still buys this one allocation before any body byte has
+// arrived. Accepted deliberately, because it is bounded: at most once per
+// connection — the continuation reads run under ReadTimeout, so a peer that
+// stalls after declaring takes the connection down with it. Growing the buffer
+// as payloads arrive would blunt that, at the cost of roughly doubling peak
+// memory for every valid large frame, which is the common case. Contrast the
+// self-contained path, where the same lie is repeatable per-request and is
+// therefore rejected before the allocation instead (see frameSource).
+//
 // netStart/netEnd are the network-read window of the first segment, for
 // FrameHeaderObserver. netEnd is extended below if the CQL header itself needed
 // more segments to arrive — but only that far: the observer's End is when the
