@@ -3098,11 +3098,20 @@ func TestConnReadDelegatesToConnReader(t *testing.T) {
 // (bytes, error) steps and which records every setDisarm transition. It lets tests
 // drive partial reads, timing-out reads and the disarm/re-arm pairing without a
 // socket, and — being a connReadSource — it can be installed as Conn.r.
+//
+// A step means "the peer delivered these bytes, and then this error", not "one
+// Read call": a step's bytes are handed out across as many reads as the caller
+// takes to consume them, and the error surfaces on the read that empties it. So a
+// script stays meaningful regardless of how the code under test sizes its reads —
+// which matters because the header readers deliberately read the first byte on its
+// own (headerReader).
 type scriptedReadSource struct {
-	steps   []scriptedRead
-	step    int
-	disarms []bool // every value passed to setDisarm, in order
-	arms    int    // reads started while not disarmed
+	steps    []scriptedRead
+	step     int
+	consumed int    // bytes of steps[step].data already delivered
+	disarms  []bool // every value passed to setDisarm, in order
+	arms     int    // reads started while not disarmed
+	readLens []int  // len(p) of every read, in order
 }
 
 type scriptedRead struct {
@@ -3116,12 +3125,20 @@ func (s *scriptedReadSource) Read(p []byte) (int, error) {
 	if len(s.disarms) == 0 || !s.disarms[len(s.disarms)-1] {
 		s.arms++
 	}
+	s.readLens = append(s.readLens, len(p))
 	if s.step >= len(s.steps) {
 		return 0, io.EOF
 	}
 	step := s.steps[s.step]
+	n := copy(p, step.data[s.consumed:])
+	s.consumed += n
+	if s.consumed < len(step.data) {
+		// More of this step's bytes to come; its error belongs to the read that
+		// delivers the last of them.
+		return n, nil
+	}
 	s.step++
-	n := copy(p, step.data)
+	s.consumed = 0
 	return n, step.err
 }
 
@@ -3260,8 +3277,74 @@ func TestReadFirstSegmentHeaderDisarmsAndRearms(t *testing.T) {
 
 			_, _ = c.readFirstSegmentHeader()
 
-			require.Equal(t, []bool{true, false}, r.disarms,
-				"the header read must be bracketed by exactly one disarm and one re-arm")
+			// Asserted as a shape rather than an exact slice: the re-arm can come from
+			// headerReader (as soon as a byte arrives) as well as from the deferred
+			// clear, so a successful read legitimately clears twice. What must hold is
+			// that the read starts disarmed, ends re-armed, and is never re-disarmed —
+			// the last of those is what a redundant deferred clear must stay harmless
+			// for.
+			require.NotEmpty(t, r.disarms, "the header read must disarm the deadline")
+			require.True(t, r.disarms[0], "the idle wait must start with the deadline disarmed")
+			require.False(t, r.disarms[len(r.disarms)-1],
+				"the deadline must be re-armed before readFirstSegmentHeader returns")
+			for i, d := range r.disarms[1:] {
+				require.False(t, d, "setDisarm(true) at index %d: the deadline must never be re-disarmed", i+1)
+			}
+		})
+	}
+}
+
+// TestHeaderReadDisarmIsBoundedToTheFirstByte pins that only the idle wait for a
+// header's first byte runs without a read deadline.
+//
+// The disarm is per-read (connReader.armDeadline runs once per read attempt), so a
+// disarm held across the whole header read leaves every byte of it unbounded: a peer
+// that sends one byte and then stops holds the serve goroutine for as long as it
+// keeps the socket open, and ReadTimeout never drops the connection. That cannot be
+// asserted by waiting — the point of the bug is that nothing ever returns — so it is
+// pinned on the mechanism instead: the first read asks for a single byte, and the
+// deadline is re-armed before the second read starts.
+func TestHeaderReadDisarmIsBoundedToTheFirstByte(t *testing.T) {
+	t.Parallel()
+
+	// A peer that delivers one byte of the header and then stalls until the re-armed
+	// deadline expires.
+	steps := []scriptedRead{{data: []byte{0x84}}, {err: timeoutErr{}}}
+
+	for _, tc := range []struct {
+		name string
+		read func(*Conn) error
+	}{
+		{
+			name: "frame header",
+			read: func(c *Conn) error { _, err := c.readFrameHeader(c.r); return err },
+		},
+		{
+			name: "segment header",
+			read: func(c *Conn) error { _, err := c.readFirstSegmentHeader(); return err },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &scriptedReadSource{steps: steps}
+			c := &Conn{r: r}
+
+			err := tc.read(c)
+
+			require.Error(t, err)
+			// Not normalised: a timeout that already consumed part of a header leaves
+			// the stream at an unknown offset, so serve() must close the connection
+			// rather than resume and mis-frame everything after it.
+			require.False(t, errors.Is(err, ErrReadHeaderTimeout),
+				"a timeout partway through a header must stay fatal, got %q", err)
+
+			require.GreaterOrEqual(t, len(r.readLens), 2,
+				"the header must be read in more than one read for the deadline to be re-armed in between")
+			require.Equal(t, 1, r.readLens[0],
+				"the unbounded read must ask for a single byte, so only the idle wait is unbounded")
+			require.Equal(t, 1, r.arms,
+				"exactly one read must start with the deadline re-armed: the one after the first byte arrived")
 		})
 	}
 }

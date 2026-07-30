@@ -200,14 +200,25 @@ type Conn struct {
 	// segScratch holds the reusable buffers inbound v5 segments are read into.
 	// Only touched by the receive path, which runs on the serve() goroutine.
 	segScratch segmentScratch
-	// segHeaderReader counts the bytes consumed by the current segment-header read
-	// (see readFirstSegmentHeader). Reused rather than allocated per header, and
-	// like segScratch only touched on the serve() goroutine.
-	segHeaderReader countingReader
-	r               connReadSource
-	session         *Session
-	framers         connFramers
-	cancel          context.CancelFunc
+	// headerReader is the reader the current frame or segment header is read
+	// through (see readFrameHeader, readFirstSegmentHeader). Reused rather than
+	// allocated per header, and like segScratch only touched by whichever
+	// goroutine is currently receiving. The two header reads never nest, and the
+	// startup coordinator's reader never overlaps serve(): a frameTicker tick is
+	// only sent while the previous response is still outstanding, and
+	// processFrameSource touches neither field after handing that response to its
+	// caller.
+	//
+	// Note that last clause is what makes it safe, not an ordering — setupConn
+	// returns on the startupErr send, which the options goroutine performs before
+	// close(frameTicker), so the startup reader can still be unwinding when
+	// serve() starts. Work added to processFrameSource after the response is
+	// delivered would need a real barrier here.
+	headerReader headerReader
+	r            connReadSource
+	session      *Session
+	framers      connFramers
+	cancel       context.CancelFunc
 	// currentKeyspace is the keyspace this connection was switched to by
 	// Conn.UseKeyspace, and the default the prepared-statement cache is keyed by
 	// (see executeQuery/executeBatch). It deliberately tracks only driver-issued
@@ -813,14 +824,16 @@ func (c *Conn) serve(ctx context.Context) {
 		// A benign idle timeout: the peer simply had nothing to send. Log it and
 		// read again rather than dropping a healthy connection.
 		//
-		// Expected to be unreachable in practice — every header read runs with the
-		// read deadline disarmed (readFrameHeader, readFirstSegmentHeader), so it
-		// cannot time out at all. The branch is kept as the safety net for a regression
-		// in that disarm: without it, such a regression would close every idle
-		// connection once per ReadTimeout instead of printing this line. It is
-		// deliberately narrow — a timeout that already consumed part of a header is
-		// not normalised to ErrReadHeaderTimeout, because the stream position would be
-		// unknown and continuing would mis-frame everything after it.
+		// Expected to be unreachable in practice — the wait for a header's first byte
+		// runs with the read deadline disarmed (readFrameHeader,
+		// readFirstSegmentHeader), so an idle connection cannot time out at all. The
+		// branch is kept as the safety net for a regression in that disarm: without
+		// it, such a regression would close every idle connection once per ReadTimeout
+		// instead of printing this line. It is deliberately narrow — the deadline is
+		// re-armed once the peer starts sending, and a timeout that already consumed
+		// part of a header is not normalised to ErrReadHeaderTimeout, because the
+		// stream position would be unknown and continuing would mis-frame everything
+		// after it.
 		if errors.Is(err, ErrReadHeaderTimeout) {
 			c.logger.Print("gocql: read header timeout") // TODO: Provide more details from wrapped error?
 			err = nil
@@ -960,10 +973,13 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 }
 
 // readFrameHeader reads one CQL frame header from r with the read deadline
-// disarmed: the serve() loop waits indefinitely for the next inbound frame, so a
-// short ReadTimeout must not fire here. The deadline is re-armed before returning,
-// so the body read that follows is still bounded by the operational timeout — and
-// re-armed via defer, so a panic cannot leave the connection deadline-free.
+// disarmed for its first byte: the serve() loop waits indefinitely for the next
+// inbound frame, so a short ReadTimeout must not fire on an idle connection. Once
+// the peer has started sending, headerReader re-arms the deadline, so the rest of
+// the header — and the body read that follows — are bounded by the operational
+// timeout. The disarm is also cleared via defer, which covers the paths that
+// deliver no byte at all, and means a panic cannot leave the connection
+// deadline-free.
 //
 // Disarming through a dedicated flag (rather than zeroing and restoring the
 // connReader timeout) keeps the operational timeout intact, so a concurrent
@@ -974,11 +990,14 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 // is a reader over an already-received segment payload, which has no deadline to
 // disarm. Missing it in that case is correct, not a bug.
 func (c *Conn) readFrameHeader(r io.Reader) (frm.FrameHeader, error) {
-	if d, ok := r.(deadlineDisarmer); ok {
+	d, _ := r.(deadlineDisarmer)
+	if d != nil {
 		d.setDisarm(true)
 		defer d.setDisarm(false)
 	}
-	return readHeader(r, c.headerBuf[:])
+
+	c.headerReader.reset(r, d)
+	return readHeader(&c.headerReader, c.headerBuf[:])
 }
 
 func (c *Conn) processFrameSource(ctx context.Context, src frameSource) error {
@@ -1153,10 +1172,10 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 	// Read the first segment's header with the read deadline disarmed: on an
 	// idle connection the serve() loop blocks here waiting for the peer to
 	// start sending the next frame, and that wait must not be bounded by
-	// ReadTimeout. Only the idle wait for the header is unbounded — the payload
-	// of this segment and any continuation segments are read with the deadline
-	// re-armed, so a peer that sends a header and then stalls mid-read is
-	// caught by the per-read ReadTimeout.
+	// ReadTimeout. Only the wait for the header's first byte is unbounded — the
+	// rest of the header (headerReader), the payload of this segment and any
+	// continuation segments are all read with the deadline re-armed, so a peer that
+	// starts sending and then stalls mid-read is caught by the per-read ReadTimeout.
 	//
 	// Note the deadline is per-read (see connReader.Read), not per-frame: a
 	// single logical CQL frame may span many segments (recvSplitFrame), so
@@ -1207,52 +1226,88 @@ func (c *Conn) observedNow() time.Time {
 	return time.Now()
 }
 
-// countingReader counts the bytes a wrapped reader delivered, so a caller can tell
-// a read that consumed nothing from one that consumed part of what it wanted.
-type countingReader struct {
+// headerReader reads one frame or segment header, bounding the read-deadline
+// disarm to the wait for its first byte.
+//
+// The idle wait has to be unbounded: serve() blocks on the next header for as long
+// as the peer has nothing to send, and a short ReadTimeout must not drop a healthy
+// connection. But once the first byte has arrived the peer is mid-header, and the
+// rest belongs under ReadTimeout like any other transfer — otherwise a peer that
+// sends one byte and then stops holds the serve goroutine for as long as it keeps
+// the socket open, and the connection is never dropped.
+//
+// The disarm is per-read (connReader.armDeadline runs once per read attempt), so
+// bounding it means capping the first read to a single byte and clearing the disarm
+// before the next one; the remainder is then read with the deadline armed. Capping
+// costs one extra read of a bufio.Reader, which the first read has already filled
+// from the socket.
+//
+// n counts the bytes delivered. That is the caller's benign-vs-fatal signal for a
+// header-read timeout: nothing consumed is the idle peer, part of a header consumed
+// leaves the stream at an unknown offset (readFirstSegmentHeader, readHeader).
+type headerReader struct {
 	r io.Reader
-	n int
+	// disarm is the reader whose deadline is disarmed for the first byte, and is
+	// cleared once that byte arrives so the cap and the re-arm happen exactly once.
+	// Nil when there is no deadline to bound: on proto v5 the CQL header is parsed
+	// out of a segment payload that has already been received.
+	disarm deadlineDisarmer
+	n      int
 }
 
-func (c *countingReader) reset(r io.Reader) {
-	c.r = r
-	c.n = 0
+func (h *headerReader) reset(r io.Reader, disarm deadlineDisarmer) {
+	h.r = r
+	h.disarm = disarm
+	h.n = 0
 }
 
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += n
+func (h *headerReader) Read(p []byte) (int, error) {
+	if h.disarm != nil && len(p) > 1 {
+		// Only the wait for the first byte runs without a deadline.
+		p = p[:1]
+	}
+	n, err := h.r.Read(p)
+	h.n += n
+	if n > 0 && h.disarm != nil {
+		// The peer has started sending: bound everything from here on. The caller's
+		// deferred re-arm still covers the paths that deliver no byte at all.
+		h.disarm.setDisarm(false)
+		h.disarm = nil
+	}
 	return n, err
 }
 
-// readFirstSegmentHeader reads the header of the next segment while the read
-// deadline is disarmed, so an idle serve() loop can block indefinitely waiting
-// for the next frame to begin. The deadline is disarmed via a dedicated flag
-// (so connReader.Read does not re-arm it) and always re-armed before the caller
-// reads the payload. Disarming this way leaves the operational timeout value
-// intact, so a concurrent finalizeConnection switching the reader from
-// ConnectTimeout to ReadTimeout is never clobbered.
+// readFirstSegmentHeader reads the header of the next segment, with the read
+// deadline disarmed for its first byte so an idle serve() loop can block
+// indefinitely waiting for the next frame to begin. The deadline is disarmed via a
+// dedicated flag (so connReader.Read does not re-arm it), which leaves the
+// operational timeout value intact, so a concurrent finalizeConnection switching
+// the reader from ConnectTimeout to ReadTimeout is never clobbered.
 //
-// A read timeout during this idle wait is normalised to ErrReadHeaderTimeout so
+// Only the idle wait is unbounded. headerReader re-arms the deadline as soon as the
+// peer delivers a byte, so the rest of the header is bounded by ReadTimeout and a
+// peer that sends a header prefix and then stalls cannot hold the serve goroutine;
+// the deferred clear covers the paths that deliver no byte at all, and a panic.
+//
+// A read timeout during the idle wait is normalised to ErrReadHeaderTimeout so
 // serve() treats it as a benign idle timeout instead of closing the connection —
 // but only if the read consumed nothing. A timeout partway through a header leaves
 // the stream at an unknown offset, so it stays a plain error and takes the
-// connection down rather than mis-framing everything that follows.
+// connection down rather than mis-framing everything that follows. That is the
+// timeout the re-arm above makes reachable.
 func (c *Conn) readFirstSegmentHeader() (segmentHeader, error) {
 	// No type assertion: Conn.r is a connReadSource, so the disarm always applies.
-	// Deferred so a panic in the header read cannot leave the connection with its
-	// deadline permanently disarmed.
 	c.r.setDisarm(true)
 	defer c.r.setDisarm(false)
 
 	// Counted rather than plumbing a byte count out of the segment header readers:
 	// the count only matters here, where the benign/fatal decision is made.
-	c.segHeaderReader.reset(c.r)
+	c.headerReader.reset(c.r, c.r)
 
-	hdr, err := readSegmentHeader(&c.segHeaderReader, c.compressor)
+	hdr, err := readSegmentHeader(&c.headerReader, c.compressor)
 	if err != nil {
 		var netErr net.Error
-		if c.segHeaderReader.n == 0 && errors.As(err, &netErr) && netErr.Timeout() {
+		if c.headerReader.n == 0 && errors.As(err, &netErr) && netErr.Timeout() {
 			return segmentHeader{}, fmt.Errorf("%w: %w", ErrReadHeaderTimeout, err)
 		}
 		return segmentHeader{}, err
