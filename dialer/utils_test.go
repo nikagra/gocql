@@ -32,6 +32,27 @@ func TestGetFrameHashEmpty(t *testing.T) {
 	}
 }
 
+// TestFrameIsProtoV5OrNewer pins that the version comparison masks off the
+// direction bit (a v5 response byte is 0x85) and that short input is not a
+// match.
+func TestFrameIsProtoV5OrNewer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{"v5 request", []byte{0x05, 0x00}, true},
+		{"v5 response", []byte{0x85}, true},
+		{"v4 request", []byte{0x04}, false},
+		{"v4 response", []byte{0x84}, false},
+		{"empty", nil, false},
+	} {
+		if got := FrameIsProtoV5OrNewer(tc.b); got != tc.want {
+			t.Errorf("%s: FrameIsProtoV5OrNewer(% X) = %v, want %v", tc.name, tc.b, got, tc.want)
+		}
+	}
+}
+
 // executeFrameV4 builds a minimal protocol v4 EXECUTE request frame. version is
 // taken as-is so callers can set the request/response direction bit.
 //

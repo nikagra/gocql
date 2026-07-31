@@ -1,9 +1,29 @@
 package dialer
 
 import (
+	"errors"
+
 	frm "github.com/gocql/gocql/internal/frame"
 	"github.com/gocql/gocql/internal/murmur"
 )
+
+// ErrProtoV5NotSupported is returned by the record/replay dialers for protocol
+// v5+ connections. After the handshake v5 switches to transport segments
+// (framer.prepareModernLayout), which these dialers would silently corrupt:
+// the recorder slices the byte stream into frames by the fixed CQL header
+// offsets, and the replayer patches stream ids in place, invalidating segment
+// CRCs. Segment-aware record/replay is tracked in
+// https://github.com/scylladb/gocql/issues/937.
+var ErrProtoV5NotSupported = errors.New("gocql/dialer: protocol v5+ uses transport segments, which the record/replay dialers do not support (see scylladb/gocql#937)")
+
+// FrameIsProtoV5OrNewer reports whether b starts a CQL frame whose protocol
+// version is v5 or newer. It is only meaningful for bytes at a frame boundary.
+// The driver's handshake frames are never segment-framed, so checking each
+// frame's first byte rejects a v5+ connection during the handshake, before any
+// transport segment flows.
+func FrameIsProtoV5OrNewer(b []byte) bool {
+	return len(b) > 0 && b[0]&protoVersionMask >= protoVersion5
+}
 
 type Record struct {
 	Data     []byte `json:"data"`
